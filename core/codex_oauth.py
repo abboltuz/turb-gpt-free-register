@@ -1225,6 +1225,16 @@ def _submit_email_otp(session: BrowserSession, code: str) -> dict:
 # 步骤 3-4：手机号验证（接码，失败换号重试）
 # ============================================================
 
+def _mask_phone(phone: str) -> str:
+    """Маскирование номера телефона для логов (например, +12***89)."""
+    if not phone:
+        return ""
+    s = str(phone).strip()
+    if len(s) <= 4:
+        return "***"
+    return s[:2] + "***" + s[-2:]
+
+
 def _sms_provider_name() -> str:
     """当前接码通道名，仅用于 Codex 流程日志。"""
     return str(getattr(_cfg, "SMS_PROVIDER", "grizzly") or "grizzly").strip().lower()
@@ -1257,9 +1267,10 @@ def _do_phone_verification(session: BrowserSession) -> dict:
             activation_id = None
             try:
                 activation_id, phone = sms_provider.acquire_number(http)
+                masked_phone = _mask_phone(phone) if provider == "smsfast" else f"+{phone}"
                 logger.info(
                     f"[Codex] 手机验证尝试 {attempt}/{max_retries}，"
-                    f"provider={provider}, activation_id={activation_id}, 号码=+{phone}"
+                    f"provider={provider}, activation_id={activation_id}, 号码={masked_phone}"
                 )
 
                 # 发短信
@@ -1293,7 +1304,10 @@ def _do_phone_verification(session: BrowserSession) -> dict:
                     )
                     sms_code = sms_provider.wait_for_sms_code(activation_id, http)
                 except sms_provider.SmsCodeTimeout:
-                    logger.warning(f"[Codex] 号码 +{phone} 在 {_cfg.SMS_CODE_WAIT}s 内未收到短信，取消换号")
+                    masked_phone = _mask_phone(phone) if provider == "smsfast" else f"+{phone}"
+                    logger.warning(f"[Codex] 号码 {masked_phone} 在 {_cfg.SMS_CODE_WAIT}s 内未收到短信，取消换号")
+                    # Для SmsFast cancel может выбросить SmsReconciliationNeededError,
+                    # которая должна быть обработана/проброшена.
                     sms_provider.cancel(activation_id, http)
                     _sleep_before_phone_retry(attempt, max_retries)
                     continue
@@ -1324,11 +1338,20 @@ def _do_phone_verification(session: BrowserSession) -> dict:
             except sms_provider.SmsNoBalanceError:
                 # 余额不足，重试无意义，直接抛
                 raise
+            except sms_provider.SmsReconciliationNeededError as exc:
+                # Состояние заказа/отмены не подтверждено - fail-closed: блокируем дальнейшую покупку
+                logger.error(f"[Codex] 接码状态未对齐，停止重试以防白扣费：{exc}")
+                raise
             except sms_provider.SmsProviderError as exc:
                 last_err = exc
                 logger.warning(f"[Codex] 接码尝试 {attempt} 失败：{exc}")
                 if activation_id:
-                    sms_provider.cancel(activation_id, http)
+                    try:
+                        sms_provider.cancel(activation_id, http)
+                    except sms_provider.SmsReconciliationNeededError:
+                        raise
+                    except Exception:
+                        pass
                 _sleep_before_phone_retry(attempt, max_retries)
                 continue
 

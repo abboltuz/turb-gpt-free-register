@@ -57,6 +57,10 @@ class SmsCodeTimeout(SmsProviderError):
     """单个号等短信超时（OpenAI 没发或没到达）。"""
 
 
+class SmsReconciliationNeededError(SmsProviderError):
+    """接码平台状态不明确/取消未被明确确认退款，需核对，禁止继续买新号。"""
+
+
 def _http() -> CurlSession:
     s = CurlSession(impersonate=IMPERSONATE)
     s.timeout = _cfg.SMS_REQUEST_TIMEOUT
@@ -387,6 +391,18 @@ def _h_phone_acquire_mode() -> str:
 # 取号
 # ============================================================
 
+def _smsfast_client() -> "SmsFastClient":
+    from core.smsfast_provider import SmsFastClient
+    api_key = str(getattr(_cfg, "SMSFAST_API_KEY", "") or "").strip()
+    if not api_key:
+        api_key = str(getattr(_cfg, "SMS_API_KEY", "") or "").strip()
+    if not api_key:
+        raise SmsProviderError("SMSFast API Key 不能为空 (SMSFAST_API_KEY 或 SMS_API_KEY)")
+    base_url = str(getattr(_cfg, "SMSFAST_API_BASE", "") or "https://smsfastapi.com/stubs/handler_api.php").strip()
+    timeout = int(getattr(_cfg, "SMS_REQUEST_TIMEOUT", 30) or 30)
+    return SmsFastClient(api_key=api_key, base_url=base_url, timeout=timeout)
+
+
 def acquire_number(
     http: CurlSession | None = None,
     service: str | None = None,
@@ -404,6 +420,35 @@ def acquire_number(
     own_http = http is None
     http = http or _http()
     try:
+        if _provider() == "smsfast":
+            client = _smsfast_client()
+            svc = service or getattr(_cfg, "SMSFAST_SERVICE", "dr") or _cfg.SMS_SERVICE or "dr"
+            cntry = country or getattr(_cfg, "SMSFAST_COUNTRY", "10") or _cfg.SMS_COUNTRY or "10"
+            max_p = getattr(_cfg, "SMSFAST_MAX_PRICE", None) or _cfg.SMS_MAX_PRICE or None
+            try:
+                activation_id, phone = client.acquire_number(
+                    service=svc,
+                    country=cntry,
+                    max_price=max_p,
+                    http=http,
+                )
+                _ACQUIRED_AT[activation_id] = time.time()
+                return activation_id, phone
+            except Exception as e:
+                # Map SmsFast typed errors to SmsProvider errors
+                from core.smsfast_provider import (
+                    SmsFastNoBalanceError,
+                    SmsFastNoNumbersError,
+                    SmsFastReconciliationNeededError,
+                )
+                if isinstance(e, SmsFastNoBalanceError):
+                    raise SmsNoBalanceError(str(e))
+                if isinstance(e, SmsFastNoNumbersError):
+                    raise SmsNoNumbersError(str(e))
+                if isinstance(e, SmsFastReconciliationNeededError):
+                    raise SmsReconciliationNeededError(str(e))
+                raise SmsProviderError(str(e))
+
         if _provider() == "smsbower":
             params, text = _request_smsbower_number(http, _smsbower_number_params(service, country))
             if params["action"] == "getNumberV2":
@@ -554,6 +599,30 @@ def wait_for_sms_code(
                 f"[SMS] 第 {round_no} 轮获取验证码 activation_id={activation_id}，"
                 f"已等 {elapsed}s，剩余约 {remaining_before}s"
             )
+            if provider == "smsfast":
+                client = _smsfast_client()
+                fast_wait = max_wait if max_wait is not None else int(getattr(_cfg, "SMSFAST_TIMEOUT", 180) or 180)
+                try:
+                    from core.registration_service import check_stop_requested
+                    stop_cb = check_stop_requested
+                except ImportError:
+                    stop_cb = None
+                try:
+                    return client.wait_for_code(
+                        activation_id,
+                        max_wait=fast_wait,
+                        poll_interval=interval,
+                        http=http,
+                        check_stop_callback=stop_cb,
+                    )
+                except Exception as e:
+                    from core.smsfast_provider import SmsFastTimeoutError, SmsFastReconciliationNeededError
+                    if isinstance(e, SmsFastTimeoutError):
+                        raise SmsCodeTimeout(str(e))
+                    if isinstance(e, SmsFastReconciliationNeededError):
+                        raise SmsReconciliationNeededError(str(e))
+                    raise SmsProviderError(str(e))
+
             if provider == "l":
                 data = _post_l_json(http, "/api/admin/l/fetch-code", {"id": activation_id})
                 code = str(data.get("code") or "").strip()
@@ -632,6 +701,11 @@ def set_status(activation_id: str, status: int, http: CurlSession | None = None)
         if _provider() == "l":
             logger.debug(f"[SMS:L] 忽略状态设置 id={activation_id}, status={status}")
             return "OK"
+        if _provider() == "smsfast":
+            if int(status) == 1:
+                return "OK"
+            client = _smsfast_client()
+            return client.set_status(activation_id, status, http=http)
         if _provider() == "smsbower":
             if int(status) == 1:
                 return "OK"
@@ -652,6 +726,14 @@ def complete(activation_id: str, http: CurlSession | None = None) -> None:
         # H 成功 fetch-code 后后台会自动按多次收码策略重取；这里不 release。
         logger.info(f"[SMS:H] 已完成 id={activation_id}")
         _ACQUIRED_AT.pop(activation_id, None)
+        return
+    if _provider() == "smsfast":
+        try:
+            set_status(activation_id, 6, http=http)
+        except Exception as exc:
+            logger.warning(f"[SMSFast] 标记完成失败（不影响结果）：{exc}")
+        finally:
+            _ACQUIRED_AT.pop(activation_id, None)
         return
     if _provider() == "smsbower":
         try:
@@ -730,6 +812,20 @@ def cancel(activation_id: str, http: CurlSession | None = None, background: bool
             _release_h_number(activation_id, http=http)
         except Exception as exc:
             logger.warning(f"[SMS:H] 释放号码失败（不影响主流程）：id={activation_id}, {type(exc).__name__}: {exc}")
+            _ACQUIRED_AT.pop(activation_id, None)
+        return
+    if _provider() == "smsfast":
+        client = _smsfast_client()
+        try:
+            client.cancel_and_verify(activation_id, http=http)
+        except Exception as exc:
+            from core.smsfast_provider import SmsFastReconciliationNeededError
+            if isinstance(exc, SmsFastReconciliationNeededError):
+                logger.error(f"[SMSFast] Cancellation requires reconciliation: {exc}")
+                raise SmsReconciliationNeededError(str(exc))
+            logger.warning(f"[SMSFast] Cancellation error: {exc}")
+            raise SmsReconciliationNeededError(f"SMSFast cancellation failed: {exc}")
+        finally:
             _ACQUIRED_AT.pop(activation_id, None)
         return
     if _provider() == "smsbower":
