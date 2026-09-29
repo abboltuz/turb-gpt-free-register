@@ -140,6 +140,7 @@ def handle_runner_request(
     proxy = req.get("proxy", "")
     totp_secret = req.get("totp_secret")
     email_otp_mode = req.get("email_otp_mode", "manual")
+    mail_provider = req.get("mail_provider")
     smsfast_raw = req.get("smsfast_config")
 
     smsfast_cfg: SmsFastRunnerConfig | None = None
@@ -165,6 +166,27 @@ def handle_runner_request(
 
     # Setup email OTP callback if manual OTP over IPC is supported and socket is available
     email_otp_cb = None
+    if email_otp_mode not in {"manual", "auto"}:
+        return {"ok": False, "status": "failed", "error_code": "invalid_email_otp_mode", "redacted_error": "Invalid email OTP mode"}
+
+    if email_otp_mode == "auto":
+        supported_mail_providers = {"outlook", "generic_api", "imap", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "remail"}
+        if mail_provider not in supported_mail_providers:
+            return {"ok": False, "status": "failed", "error_code": "invalid_mail_provider", "redacted_error": "Unsupported automatic mailbox provider"}
+        # Validate that the selected provider already knows this mailbox. Account Manager
+        # does not provision or borrow mailbox credentials from another account.
+        from core.email_provider import _registered_email_source
+        registered_source = _registered_email_source(email)
+        if registered_source and registered_source != mail_provider:
+            return {"ok": False, "status": "failed", "error_code": "mail_provider_mismatch", "redacted_error": "Mailbox source does not match the configured mailbox profile"}
+        try:
+            from core.email_provider import resolve_email_source
+            resolved_source = resolve_email_source(email)
+        except Exception:
+            resolved_source = None
+        if not resolved_source or resolved_source != mail_provider:
+            return {"ok": False, "status": "failed", "error_code": "mailbox_not_configured", "redacted_error": "Automatic mailbox profile is not configured for this address"}
+
     if client_sock is not None and email_otp_mode == "manual":
         def _ipc_email_otp_callback(cb_email: str, after_ts: float) -> str:
             # 1. Send challenge prompt event (NO SECRETS: password/totp/tokens omitted)
@@ -197,6 +219,8 @@ def handle_runner_request(
         totp_secret=totp_secret,
         email_otp_callback=email_otp_cb,
         smsfast_config=smsfast_cfg,
+        email_otp_mode=email_otp_mode,
+        mail_provider=mail_provider,
     )
 
     resp: dict[str, Any] = {

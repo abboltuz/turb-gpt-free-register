@@ -138,6 +138,8 @@ class ExistingAccountOAuthSession:
         password: str,
         totp_secret: str | None = None,
         email_otp_callback: Callable[[str, float], str] | None = None,
+        email_otp_mode: str = "manual",
+        mail_provider: str | None = None,
     ):
         if not proxy or not str(proxy).strip():
             raise ValueError("Proxy is strictly required for ExistingAccountOAuthSession (no direct fallback allowed)")
@@ -151,6 +153,8 @@ class ExistingAccountOAuthSession:
         self.password = str(password)
         self.totp_secret = str(totp_secret).strip() if totp_secret else None
         self.email_otp_callback = email_otp_callback
+        self.email_otp_mode = email_otp_mode
+        self.mail_provider = mail_provider
 
         self.session_id = str(uuid.uuid4())
         self.fingerprint_seed = f"sub2api-existing:{self.email}:{self.session_id}"
@@ -231,9 +235,18 @@ class ExistingAccountOAuthSession:
         if not password_login_done and (
             login_status == "email_otp" or codex_oauth._is_email_otp_step(auth_result)
         ):
-            if not self.email_otp_callback:
-                raise RuntimeError("auth_requires_email_otp")
-            email_otp = self.email_otp_callback(self.email, otp_after_ts)
+            if self.email_otp_mode == "auto":
+                from core.email_provider import wait_for_otp
+                email_otp = wait_for_otp(
+                    self.email,
+                    after_ts=otp_after_ts,
+                    email_source=self.mail_provider,
+                    force_service=True,
+                )
+            else:
+                if not self.email_otp_callback:
+                    raise RuntimeError("auth_requires_email_otp")
+                email_otp = self.email_otp_callback(self.email, otp_after_ts)
             auth_result = codex_oauth._submit_email_otp(self.session, email_otp)
 
         # Step 6: Phone verification ONLY if required by Auth
@@ -389,6 +402,8 @@ def run_existing_account_oauth(
     totp_secret: str | None = None,
     email_otp_callback: Callable[[str, float], str] | None = None,
     smsfast_config: SmsFastRunnerConfig | None = None,
+    email_otp_mode: str = "manual",
+    mail_provider: str | None = None,
 ) -> ExistingAccountRunnerResult:
     """
     Main entrypoint for existing account OAuth authorization.
@@ -450,6 +465,8 @@ def run_existing_account_oauth(
                 password=password,
                 totp_secret=totp_secret,
                 email_otp_callback=email_otp_callback,
+                email_otp_mode=email_otp_mode,
+                mail_provider=mail_provider,
             )
         except ValueError as exc:
             # Proxy configuration invalid / direct connection forbidden

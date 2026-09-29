@@ -289,6 +289,35 @@ class TestExistingAccountIPC(unittest.TestCase):
         finally:
             daemon.stop()
 
+    def test_ipc_auto_email_otp_skips_manual_prompt(self):
+        received = {}
+
+        def mock_runner(email, password, proxy, email_otp_callback=None, **kwargs):
+            received.update(kwargs)
+            self.assertIsNone(email_otp_callback)
+            return ExistingAccountRunnerResult(ok=True, status="success", email=email, account_id="auto-otp")
+
+        daemon = ExistingAccountIPCDaemon(self.sock_path, runner_fn=mock_runner)
+        daemon.start()
+        try:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.connect(self.sock_path)
+            write_framed_json(client, {
+                "action": "run_existing_oauth",
+                "email": "user@example.com",
+                "password": "secretpassword",
+                "proxy": "http://127.0.0.1:8080",
+                "email_otp_mode": "auto",
+                "mail_provider": "generic_api",
+            })
+            response = read_framed_json(client)
+            self.assertTrue(response.get("ok"))
+            self.assertEqual(received.get("email_otp_mode"), "auto")
+            self.assertEqual(received.get("mail_provider"), "generic_api")
+            client.close()
+        finally:
+            daemon.stop()
+
     def test_ipc_body_limit(self):
         daemon = ExistingAccountIPCDaemon(self.sock_path)
         daemon.start()
