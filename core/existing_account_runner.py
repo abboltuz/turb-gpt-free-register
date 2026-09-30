@@ -92,8 +92,8 @@ class SmsFastRunnerConfig:
             raise ValueError("SmsFastRunnerConfig.countries must be a non-empty list of country codes")
         if self.timeout != 180:
             raise ValueError("SmsFastRunnerConfig.timeout must be exactly 180 seconds per ТЗ")
-        if self.max_retries_per_run < 1 or self.max_retries_per_run > 5:
-            raise ValueError("SmsFastRunnerConfig.max_retries_per_run must be between 1 and 5")
+        if self.max_retries_per_run < 1 or self.max_retries_per_run > 10:
+            raise ValueError("SmsFastRunnerConfig.max_retries_per_run must be between 1 and 10")
 
 
 @dataclass(frozen=True)

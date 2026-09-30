@@ -45,6 +45,12 @@ def test_smsfast_config_validation():
     with pytest.raises(ValueError, match="exactly 180 seconds"):
         SmsFastRunnerConfig(api_key="key", service="dr", countries=["10"], timeout=60)
 
+    # Retries bounded 1..10 (matches Sub2API backend/UI contract)
+    with pytest.raises(ValueError, match="between 1 and 10"):
+        SmsFastRunnerConfig(api_key="key", service="dr", countries=["10"], max_retries_per_run=11)
+    cfg10 = SmsFastRunnerConfig(api_key="key", service="dr", countries=["10"], max_retries_per_run=10)
+    assert cfg10.max_retries_per_run == 10
+
     # Valid config
     cfg = SmsFastRunnerConfig(api_key="key", service="dr", countries=["10"], timeout=180, max_retries_per_run=3)
     assert cfg.timeout == 180
