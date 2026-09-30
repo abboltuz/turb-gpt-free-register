@@ -27,6 +27,7 @@ SMSFast 接码平台客户端及适配器。
   в состояние RECONCILIATION_NEEDED, и покупка следующего номера блокируется.
 """
 import logging
+import math
 import time
 
 from curl_cffi.requests import Session as CurlSession
@@ -49,7 +50,11 @@ class SmsFastNoBalanceError(SmsFastError):
 
 
 class SmsFastNoNumbersError(SmsFastError):
-    """NO_NUMBERS (нет номеров с заданными параметрами)."""
+    """NO_NUMBERS for the purchase parameters, optionally classified by read-only checks."""
+
+    def __init__(self, message: str, reason_code: str = "smsfast_no_numbers"):
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class SmsFastTimeoutError(SmsFastError):
@@ -187,7 +192,46 @@ class SmsFastClient:
         if max_price:
             params["maxPrice"] = str(max_price)
 
-        text = self._request(params, http=http)
+        try:
+            text = self._request(params, http=http)
+        except SmsFastNoNumbersError as exc:
+            # The stock catalog is not a purchase guarantee. Check the current
+            # price and balance *without* placing another order, so the failure
+            # can be classified instead of guessed from aggregate stock.
+            reason_code = "smsfast_no_numbers"
+            try:
+                # Match the catalog's getPrices query exactly; filtering by
+                # service is optional in the provider contract.
+                prices = self.get_prices(country=str(country), http=http)
+                offer = prices.get(str(country), {}).get(service, {})
+                cost = float(offer["cost"])
+                count = int(offer["count"])
+                if not math.isfinite(cost) or cost <= 0 or count < 0:
+                    raise ValueError("invalid SMSFast offer")
+                balance = self.get_balance(http=http)
+                if not math.isfinite(balance) or balance < 0:
+                    raise ValueError("invalid SMSFast balance")
+                limit = float(max_price) if max_price is not None else None
+                if limit is not None and not math.isfinite(limit):
+                    raise ValueError("invalid SMSFast maxPrice")
+                if count == 0:
+                    reason_code = "smsfast_out_of_stock"
+                else:
+                    if limit is not None and cost > limit:
+                        reason_code = "smsfast_price_limit"
+                    elif balance < cost:
+                        reason_code = "smsfast_balance_below_price"
+                    else:
+                        reason_code = "smsfast_purchase_refused_with_stock"
+                logger.warning(
+                    "[SMSFast] getNumber=NO_NUMBERS country=%s service=%s max_price=%s price=%s stock=%s balance=%s diagnosis=%s",
+                    country, service, limit, cost, count, balance, reason_code,
+                )
+            except (SmsFastError, AttributeError, KeyError, TypeError, ValueError, OverflowError):
+                # A failed read-only check must never turn a definite NO_NUMBERS
+                # into an ambiguous purchase or trigger another getNumber.
+                logger.warning("[SMSFast] getNumber=NO_NUMBERS country=%s service=%s read_only_diagnosis=unavailable", country, service)
+            raise SmsFastNoNumbersError("SMSFast getNumber returned NO_NUMBERS", reason_code=reason_code) from exc
         if not text.startswith("ACCESS_NUMBER:"):
             # Неизвестный ответ на getNumber может означать, что номер куплен, но формат не распознан.
             # Fail closed: требуем reconciliation вместо повторной покупки!
@@ -389,4 +433,3 @@ class SmsFastClient:
             return json.loads(text)
         except Exception:
             raise SmsFastError("Malformed getNumbersStatus JSON response")
-

@@ -47,7 +47,11 @@ ERROR_CODE_WHITELIST = {
     "email_otp_cancelled": "Email OTP input was cancelled.",
     "auth_requires_phone": "Phone verification requested but SMSFast is not configured.",
     "smsfast_no_balance": "Insufficient balance on SMSFast account.",
-    "smsfast_no_numbers": "No SMS phone numbers available for specified countries.",
+    "smsfast_no_numbers": "SMSFast refused to issue a number for the selected service and countries (NO_NUMBERS). Catalog stock does not guarantee a purchase.",
+    "smsfast_out_of_stock": "SMSFast returned NO_NUMBERS; a subsequent catalog check showed no stock for this service and country.",
+    "smsfast_price_limit": "SMSFast returned NO_NUMBERS; a subsequent listed price exceeds the configured maxPrice.",
+    "smsfast_balance_below_price": "SMSFast returned NO_NUMBERS; a subsequent balance check is below the listed price.",
+    "smsfast_purchase_refused_with_stock": "SMSFast returned NO_NUMBERS although a subsequent catalog check showed stock, sufficient balance and a matching price limit. Provider's reason is unknown.",
     "smsfast_invalid_key": "Invalid SMSFast API key.",
     "sms_reconciliation_needed": "SMS activation state requires reconciliation. Purchase halted to prevent extra charges.",
     "sms_timeout_unverified_refund": "SMS timeout occurred; refund confirmation cannot be independently verified. Fail closed.",
@@ -434,7 +438,8 @@ def run_existing_account_oauth(
     - Operates purely in-memory: no SQLite writes, no credentials or tokens saved to disk.
     - Direct connection allowed when no proxy is assigned (warning logged);
       import jobs still require a proxy at the Sub2API preflight level.
-    - Session isolation: each retry / attempt spins up a brand new BrowserSession with unique fingerprint.
+    - Session isolation: each attempt uses a fresh BrowserSession. NO_NUMBERS
+      falls through to other selected countries within that same session.
     - Phone purchase only when OpenAI explicitly demands phone verification.
     - If verify_chat is set (import flow), one minimal ChatGPT message round-trip
       gates success; message content is never logged.
@@ -462,7 +467,7 @@ def run_existing_account_oauth(
         )
 
     max_retries = smsfast_config.max_retries_per_run if smsfast_config else 1
-    countries = list(smsfast_config.countries) if smsfast_config else []
+    countries = list(dict.fromkeys(smsfast_config.countries)) if smsfast_config else []
 
     sms_client: SmsFastClient | None = None
     if smsfast_config:
@@ -479,7 +484,7 @@ def run_existing_account_oauth(
 
     while attempt < max_retries:
         attempt += 1
-        country = countries[(attempt - 1) % len(countries)] if countries else ""
+        country = countries[0] if countries else ""
 
         try:
             oauth_session = ExistingAccountOAuthSession(
@@ -524,17 +529,36 @@ def run_existing_account_oauth(
         try:
             failure_phase = "oauth_flow"
             def phone_handler():
+                nonlocal country
                 if not sms_client or not smsfast_config:
                     raise RuntimeError("auth_requires_phone")
-                return _handle_phone_with_smsfast(
-                    session=oauth_session.session,
-                    sms_client=sms_client,
-                    country=country,
-                    service=smsfast_config.service,
-                    max_price=smsfast_config.max_price,
-                    timeout=smsfast_config.timeout,
-                    poll_interval=smsfast_config.poll_interval,
-                )
+                # A provider NO_NUMBERS response means no purchase was made.
+                # Try distinct selected countries, but never replay the login.
+                # Any post-acquire ambiguity propagates immediately and blocks
+                # a second purchase.
+                refusal_codes = []
+                for candidate in countries[:max_retries]:
+                    country = candidate
+                    try:
+                        return _handle_phone_with_smsfast(
+                            session=oauth_session.session,
+                            sms_client=sms_client,
+                            country=candidate,
+                            service=smsfast_config.service,
+                            max_price=smsfast_config.max_price,
+                            timeout=smsfast_config.timeout,
+                            poll_interval=smsfast_config.poll_interval,
+                        )
+                    except SmsFastNoNumbersError as exc:
+                        refusal_codes.append(exc.reason_code)
+                        logger.warning("[ExistingRunner] SMSFast getNumber refused country %s: %s", candidate, exc.reason_code)
+                        if exc.reason_code not in {"smsfast_out_of_stock", "smsfast_price_limit"}:
+                            raise
+                # Preserve the useful classification for a single-country job;
+                # mixed multi-country refusals remain generic rather than
+                # incorrectly claiming the same reason for every country.
+                reason = refusal_codes[0] if len(set(refusal_codes)) == 1 else "smsfast_no_numbers"
+                raise SmsFastNoNumbersError("NO_NUMBERS for selected countries", reason_code=reason)
 
             tokens, id_claims, used_phone, _act_id = oauth_session.execute_flow(
                 smsfast_config=smsfast_config,
@@ -681,10 +705,20 @@ def run_existing_account_oauth(
                 phone_used=True,
             )
 
-        except SmsFastNoNumbersError:
-            last_error_code = "smsfast_no_numbers"
-            logger.warning(f"[ExistingRunner] No numbers for country {country}. Trying next country if available.")
-            continue
+        except SmsFastNoNumbersError as exc:
+            # getNumber is authoritative. Replaying OAuth after all selected
+            # countries refused issuance only hammers OpenAI and can trigger 429.
+            code, msg = _get_static_error(exc.reason_code, fallback_code="smsfast_no_numbers")
+            logger.warning("[ExistingRunner] SMSFast getNumber refused selected countries: %s", code)
+            return ExistingAccountRunnerResult(
+                ok=False,
+                status="failed",
+                email=mask_identifier(email),
+                error_code=code,
+                redacted_error=msg,
+                attempts=attempt,
+                phone_used=False,
+            )
 
         except Exception as exc:
             err_msg_str = str(exc)

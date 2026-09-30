@@ -71,6 +71,23 @@ def test_smsfast_acquire_number_success():
     assert params["country"] == "10"
 
 
+def test_smsfast_purchase_parameters_match_catalog_service_without_operator():
+    client = SmsFastClient(api_key="test-key")
+    session = DummySession([DummyResponse("ACCESS_NUMBER:987654:521234567890", 200)])
+
+    client.acquire_number(service="dr", country="54", max_price="4000.0", http=session)
+
+    url, params = session.calls[0]
+    assert url == DEFAULT_SMSFAST_BASE_URL
+    assert params == {
+        "api_key": "test-key",
+        "action": "getNumber",
+        "service": "dr",
+        "country": "54",
+        "maxPrice": "4000.0",
+    }
+
+
 def test_smsfast_acquire_number_no_numbers():
     client = SmsFastClient(api_key="test-key")
     session = DummySession([
@@ -80,6 +97,55 @@ def test_smsfast_acquire_number_no_numbers():
     with pytest.raises(SmsFastNoNumbersError) as exc_info:
         client.acquire_number(service="dr", country="10", http=session)
     assert "NO_NUMBERS" in str(exc_info.value)
+    assert exc_info.value.reason_code == "smsfast_no_numbers"
+    assert [params["action"] for _, params in session.calls] == ["getNumber", "getPrices"]
+
+
+@pytest.mark.parametrize("price, balance, max_price, expected", [
+    (43.16, 100.0, "15", "smsfast_price_limit"),
+    (43.16, 20.0, "4000", "smsfast_balance_below_price"),
+    (43.16, 100.0, "4000", "smsfast_purchase_refused_with_stock"),
+])
+def test_smsfast_no_numbers_diagnosis_is_read_only(price, balance, max_price, expected):
+    client = SmsFastClient(api_key="test-key")
+    session = DummySession([
+        DummyResponse("NO_NUMBERS", 200),
+        DummyResponse(f'{{"54":{{"dr":{{"cost":{price},"count":288190}}}}}}', 200),
+        DummyResponse(f"ACCESS_BALANCE:{balance}", 200),
+    ])
+
+    with pytest.raises(SmsFastNoNumbersError) as exc_info:
+        client.acquire_number(service="dr", country="54", max_price=max_price, http=session)
+
+    assert exc_info.value.reason_code == expected
+    assert [params["action"] for _, params in session.calls] == ["getNumber", "getPrices", "getBalance"]
+
+
+def test_smsfast_no_numbers_with_zero_catalog_stock():
+    client = SmsFastClient(api_key="test-key")
+    session = DummySession([
+        DummyResponse("NO_NUMBERS", 200),
+        DummyResponse('{"54":{"dr":{"cost":43.16,"count":0}}}', 200),
+        DummyResponse("ACCESS_BALANCE:100", 200),
+    ])
+
+    with pytest.raises(SmsFastNoNumbersError) as exc_info:
+        client.acquire_number(service="dr", country="54", max_price="4000", http=session)
+
+    assert exc_info.value.reason_code == "smsfast_out_of_stock"
+    assert [params["action"] for _, params in session.calls] == ["getNumber", "getPrices", "getBalance"]
+
+
+@pytest.mark.parametrize("prices", ["[]", '{"54":{"dr":null}}', "NO_NUMBERS"])
+def test_smsfast_no_numbers_preserved_when_read_only_diagnosis_fails(prices):
+    client = SmsFastClient(api_key="test-key")
+    session = DummySession([DummyResponse("NO_NUMBERS", 200), DummyResponse(prices, 200)])
+
+    with pytest.raises(SmsFastNoNumbersError) as exc_info:
+        client.acquire_number(service="dr", country="54", max_price="4000", http=session)
+
+    assert exc_info.value.reason_code == "smsfast_no_numbers"
+    assert [params["action"] for _, params in session.calls] == ["getNumber", "getPrices"]
 
 
 def test_smsfast_acquire_number_no_balance():

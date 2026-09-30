@@ -247,6 +247,108 @@ def test_phone_only_purchase_when_auth_prompts():
         assert mock_sms_client.acquire_number.call_count == 0
 
 
+@pytest.mark.parametrize("reason", ["smsfast_no_numbers", "smsfast_purchase_refused_with_stock"])
+def test_no_numbers_stops_without_replaying_oauth(reason):
+    """An aggregate stock count must not trigger repeated logins after getNumber refuses."""
+    config = SmsFastRunnerConfig(
+        api_key="smsfast_test_key", service="dr", countries=["54"],
+        max_price="4000.0", max_retries_per_run=10,
+    )
+    with patch("core.existing_account_runner.ExistingAccountOAuthSession") as session_cls, \
+         patch("core.existing_account_runner.SmsFastClient") as client_cls:
+        client_cls.return_value.acquire_number.side_effect = SmsFastNoNumbersError("NO_NUMBERS", reason_code=reason)
+        session_cls.return_value.execute_flow.side_effect = lambda **kwargs: kwargs["on_phone_prompt_needed"]()
+
+        result = run_existing_account_oauth(
+            email="test@example.com", password="secretpassword",
+            proxy="http://1.2.3.4:8080", smsfast_config=config,
+        )
+
+    assert result.status == "failed"
+    assert result.error_code == reason
+    assert result.attempts == 1
+    assert session_cls.call_count == 1
+    assert client_cls.return_value.acquire_number.call_count == 1
+    assert client_cls.return_value.acquire_number.call_args.kwargs == {
+        "service": "dr", "country": "54", "max_price": "4000.0",
+    }
+
+
+def test_no_numbers_tries_next_country_in_same_oauth_session():
+    config = SmsFastRunnerConfig(
+        api_key="smsfast_test_key", service="dr", countries=["54", "10", "54"],
+        max_retries_per_run=3,
+    )
+    with patch("core.existing_account_runner.ExistingAccountOAuthSession") as session_cls, \
+         patch("core.existing_account_runner.SmsFastClient") as client_cls:
+        client_cls.return_value.acquire_number.side_effect = SmsFastNoNumbersError("NO_NUMBERS", reason_code="smsfast_out_of_stock")
+        session_cls.return_value.execute_flow.side_effect = lambda **kwargs: kwargs["on_phone_prompt_needed"]()
+
+        result = run_existing_account_oauth(
+            email="test@example.com", password="secretpassword",
+            proxy="http://1.2.3.4:8080", smsfast_config=config,
+        )
+
+    assert result.error_code == "smsfast_out_of_stock"
+    assert result.attempts == 1
+    assert session_cls.call_count == 1
+    assert [call.kwargs["country"] for call in client_cls.return_value.acquire_number.call_args_list] == ["54", "10"]
+
+
+def test_stock_mismatch_halts_before_other_country_purchase():
+    config = SmsFastRunnerConfig(
+        api_key="smsfast_test_key", service="dr", countries=["54", "10"],
+        max_retries_per_run=3,
+    )
+    with patch("core.existing_account_runner.ExistingAccountOAuthSession") as session_cls, \
+         patch("core.existing_account_runner.SmsFastClient") as client_cls:
+        client_cls.return_value.acquire_number.side_effect = SmsFastNoNumbersError(
+            "NO_NUMBERS", reason_code="smsfast_purchase_refused_with_stock"
+        )
+        session_cls.return_value.execute_flow.side_effect = lambda **kwargs: kwargs["on_phone_prompt_needed"]()
+
+        result = run_existing_account_oauth(
+            email="test@example.com", password="secretpassword",
+            proxy="http://1.2.3.4:8080", smsfast_config=config,
+        )
+
+    assert result.error_code == "smsfast_purchase_refused_with_stock"
+    assert client_cls.return_value.acquire_number.call_count == 1
+    assert session_cls.call_count == 1
+
+
+def test_fallback_country_succeeds_without_second_oauth_or_purchase():
+    config = SmsFastRunnerConfig(
+        api_key="smsfast_test_key", service="dr", countries=["54", "10"],
+        max_retries_per_run=3,
+    )
+    successful_phone_step = ({"page": {"type": "workspace"}}, "12345", "521234567890")
+    with patch("core.existing_account_runner.ExistingAccountOAuthSession") as session_cls, \
+         patch("core.existing_account_runner.SmsFastClient") as client_cls, \
+         patch("core.existing_account_runner._handle_phone_with_smsfast") as phone_step:
+        phone_step.side_effect = [
+            SmsFastNoNumbersError("NO_NUMBERS", reason_code="smsfast_out_of_stock"),
+            successful_phone_step,
+        ]
+        session_cls.return_value.execute_flow.side_effect = lambda **kwargs: (
+            {"access_token": "test-token"},
+            {"email": "test@example.com", "account_id": "acc_123"},
+            True,
+            kwargs["on_phone_prompt_needed"]()[1],
+        )
+
+        result = run_existing_account_oauth(
+            email="test@example.com", password="secretpassword",
+            proxy="http://1.2.3.4:8080", smsfast_config=config,
+        )
+
+    assert result.ok is True
+    assert result.attempts == 1
+    assert session_cls.call_count == 1
+    assert [call.kwargs["country"] for call in phone_step.call_args_list] == ["54", "10"]
+    assert client_cls.return_value.acquire_number.call_count == 0  # mocked phone step owns purchase
+
+
 def test_exception_after_acquire_halts_no_second_get_number():
     """
     ANY exception occurring after acquire_number (e.g. OpenAI add-phone/send fails,
