@@ -53,6 +53,7 @@ ERROR_CODE_WHITELIST = {
     "sms_timeout_unverified_refund": "SMS timeout occurred; refund confirmation cannot be independently verified. Fail closed.",
     "sms_order_failed_reconciliation": "Error occurred after number purchase. Fail closed; reconciliation required.",
     "auth_flow_failed": "Authentication process failed during OAuth handshake.",
+    "openai_rate_limited": "OpenAI rate-limited authorization requests; cool down before retrying.",
     "chat_unusable": "ChatGPT rejected messages for this account.",
     "chat_verify_unavailable": "ChatGPT verification could not be completed; account not created.",
     "max_retries_exceeded": "Maximum authorization retries exceeded.",
@@ -697,6 +698,10 @@ def run_existing_account_oauth(
                 code, msg = _get_static_error("auth_requires_email_otp")
             elif "auth_requires_phone" in err_msg_str:
                 code, msg = _get_static_error("auth_requires_phone")
+            elif "429" in err_msg_str or "熔断" in err_msg_str or "rate_limited" in err_msg_str:
+                # OpenAI throttled authorization traffic (often self-inflicted by
+                # replayed logins across SMS retries): cool down, do not hammer.
+                code, msg = _get_static_error("openai_rate_limited")
             else:
                 code, msg = _get_static_error("auth_flow_failed")
 
