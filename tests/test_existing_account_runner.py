@@ -60,6 +60,17 @@ def test_oauth_proxy_uses_remote_dns_without_changing_proxy_endpoint_or_credenti
     )
 
 
+def test_entrypoint_empty_proxy_no_longer_blocked_first():
+    """Empty proxy must not return proxy_required; validation proceeds to credentials."""
+    res = run_existing_account_oauth(
+        email="test@example.com",
+        password="",
+        proxy="",
+    )
+    assert res.ok is False
+    assert res.error_code == "missing_credentials"
+
+
 def test_missing_proxy_allows_direct_connection(monkeypatch, caplog):
     """No assigned proxy is allowed; BrowserSession receives an explicit empty proxy."""
     from core.existing_account_runner import ExistingAccountOAuthSession

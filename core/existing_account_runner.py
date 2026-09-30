@@ -428,7 +428,8 @@ def run_existing_account_oauth(
     Guarantees:
     - Never passes secrets via argv/env.
     - Operates purely in-memory: no SQLite writes, no credentials or tokens saved to disk.
-    - Explicit proxy required; fail-closed on empty/direct proxy (no direct fallback).
+    - Direct connection allowed when no proxy is assigned (warning logged);
+      import jobs still require a proxy at the Sub2API preflight level.
     - Session isolation: each retry / attempt spins up a brand new BrowserSession with unique fingerprint.
     - Phone purchase only when OpenAI explicitly demands phone verification.
     - If ANY exception occurs after acquire_number, status=reconciliation_needed and never buys a second number.
@@ -437,14 +438,12 @@ def run_existing_account_oauth(
     - Validates identity: claims email must match requested email and account_id must be present.
     """
     if not proxy or not str(proxy).strip():
-        code, msg = _get_static_error("proxy_required")
-        return ExistingAccountRunnerResult(
-            ok=False,
-            status="failed",
-            email=mask_identifier(email),
-            error_code=code,
-            redacted_error=msg,
-        )
+        # Re-auth without an assigned proxy runs over a direct connection.
+        # Import jobs are still blocked earlier by the Sub2API worker preflight.
+        logger.warning("[ExistingRunner] Running OAuth without proxy (direct connection).")
+        proxy = ""
+    else:
+        proxy = _proxy_url_for_oauth(str(proxy).strip())
 
     if not email or not password:
         code, msg = _get_static_error("missing_credentials")
@@ -487,7 +486,8 @@ def run_existing_account_oauth(
                 mail_provider=mail_provider,
             )
         except ValueError as exc:
-            # Proxy configuration invalid / direct connection forbidden
+            # Session validation failed (missing credentials or proxy bind failure
+            # when a proxy was configured). Direct connection itself is allowed.
             code, msg = _get_static_error("proxy_configuration_invalid")
             return ExistingAccountRunnerResult(
                 ok=False,
