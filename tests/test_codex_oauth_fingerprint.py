@@ -57,6 +57,42 @@ class CodexOauthFingerprintTests(unittest.TestCase):
         self.assertTrue(session.header_kwargs["user_initiated"])
         self.assertEqual(len(session.calls), 1)
 
+    def test_bootstrap_authorize_does_not_route_transport_errors_to_browser(self):
+        session = _CodexSession()
+        session.responses = []
+
+        def fail_transport(*_args, **_kwargs):
+            raise RuntimeError("SOCKS transport failed")
+
+        session.get = fail_transport
+        with patch.object(codex, "_bootstrap_authorize_with_cloak") as browser_fallback:
+            with self.assertRaisesRegex(RuntimeError, "SOCKS transport failed"):
+                codex._bootstrap_authorize(
+                    session,
+                    "state",
+                    auth_url="https://auth.openai.com/oauth/authorize?state=state",
+                )
+        browser_fallback.assert_not_called()
+
+    def test_bootstrap_authorize_routes_http_403_to_browser_fallback(self):
+        session = _CodexSession()
+        response = SimpleNamespace(status_code=403, text="challenge")
+
+        def fail_http(*_args, **_kwargs):
+            error = RuntimeError("bootstrap authorize status=403")
+            error.response = response
+            raise error
+
+        session.get = fail_http
+        session.browser_profile = {}
+        with patch.object(codex, "_bootstrap_authorize_with_cloak") as browser_fallback:
+            codex._bootstrap_authorize(
+                session,
+                "state",
+                auth_url="https://auth.openai.com/oauth/authorize?state=state",
+            )
+        browser_fallback.assert_called_once_with(session, "https://auth.openai.com/oauth/authorize?state=state")
+
 
 if __name__ == "__main__":
     unittest.main()

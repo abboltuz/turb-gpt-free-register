@@ -887,12 +887,92 @@ def _bootstrap_authorize(
     headers = session.get_auth_navigate_headers(referer="", user_initiated=True)
     logger.info("[Codex] 跟随 Codex authorize URL 建立会话...")
     logger.info(f"[Codex] 完整授权地址: {auth_url}")
-    resp = _with_auth_navigation_retry(
-        session,
-        "bootstrap authorize",
-        lambda: session.get(auth_url, headers=headers, allow_redirects=True),
-    )
-    logger.debug(f"[Codex] authorize 落点: {getattr(resp, 'url', '')}, status={getattr(resp, 'status_code', '')}")
+    try:
+        resp = session.get(auth_url, headers=headers, allow_redirects=True)
+        status = int(getattr(resp, "status_code", 0) or 0)
+        if status >= 400:
+            error = RuntimeError(f"bootstrap authorize status={status}, body={(getattr(resp, 'text', '') or '')[:180]}")
+            error.response = resp
+            raise error
+        logger.debug(f"[Codex] authorize 落点: {getattr(resp, 'url', '')}, status={getattr(resp, 'status_code', '')}")
+        return
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 403:
+            # Do not disguise proxy/connectivity failures as Cloudflare challenges.
+            raise
+        logger.warning("[Codex] bootstrap authorize returned HTTP 403; checking browser challenge state")
+
+    # A browser can establish a normal session, but an unresolved challenge is not
+    # clearance and must not be presented to the protocol client as successful.
+    _bootstrap_authorize_with_cloak(session, auth_url)
+
+
+def _bootstrap_authorize_with_cloak(session: BrowserSession, auth_url: str) -> None:
+    """Uses headless CloakBrowser to open the authorize URL, solve Cloudflare Turnstile, and sync cookies into session."""
+    try:
+        from core.cloakbrowser_driver import build_cloak_driver
+    except ImportError as e:
+        raise RuntimeError(f"CloakBrowser driver module is not available: {e}")
+
+    logger.info("[Codex] 启动 CloakBrowser 处理 Cloudflare 验证...")
+    proxy_url = getattr(session, "proxy", None)
+
+    driver = None
+    try:
+        driver, _ = build_cloak_driver(proxy=proxy_url)
+        page = driver.page
+        page.goto(auth_url, wait_until="commit", timeout=45000)
+
+        # Allow initial Turnstile JavaScript to run and settle
+        settled = False
+        for s in range(12):
+            import time
+            time.sleep(1.0)
+            title = str(page.title() or "").lower()
+            body_text = str(page.locator("body").inner_text(timeout=2000) or "").lower()
+            inputs = page.locator('input[type="email"], input[name*="email" i], input[type="text"]').count()
+            if inputs > 0 or "welcome" in title or "welkom" in title or "log in" in title or "inloggen" in title:
+                settled = True
+                break
+
+            # If still on challenge after 5-6 seconds, send Tab then Space to trigger checkbox if required
+            if s in (5, 8) and ("just a moment" in title or "even geduld" in title or "challenge" in body_text or "verifi" in body_text):
+                try:
+                    page.keyboard.press("Tab")
+                    time.sleep(0.3)
+                    page.keyboard.press("Space")
+                except Exception:
+                    pass
+
+        title = str(page.title() or "").lower()
+        body_text = str(page.locator("body").inner_text(timeout=2000) or "").lower()
+        inputs = page.locator('input[type="email"], input[name*="email" i], input[type="text"]').count()
+        logger.info(f"[Codex] CloakBrowser bootstrap state: title='{title}', inputs={inputs}")
+        if inputs == 0 and ("just a moment" in title or "even geduld" in title or "verify you are human" in body_text):
+            raise RuntimeError("cloudflare_challenge_not_completed")
+
+        cookies = driver.context.cookies()
+        ua = page.evaluate("navigator.userAgent")
+
+        # Transfer all cookies from page to session's curl_cffi cookie jar
+        for c in cookies:
+            domain = c.get("domain", "")
+            if domain.startswith("."):
+                domain = domain[1:]
+            session.session.cookies.set(c["name"], c["value"], domain=domain)
+        if ua:
+            session.browser_profile["user_agent"] = ua
+        _reset_retryable_circuit(session)
+        logger.info("[Codex] CloakBrowser 已解决 Cloudflare 验证并同步 Cookie（%d 个）", len(cookies))
+    except Exception as exc:
+        error_code = str(exc) if str(exc) == "cloudflare_challenge_not_completed" else type(exc).__name__
+        logger.warning("[Codex] CloakBrowser bootstrap failed: %s", error_code)
+        raise
+    finally:
+        if driver is not None:
+            driver.quit()
 
 
 # ============================================================

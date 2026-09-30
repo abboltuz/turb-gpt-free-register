@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -54,6 +55,19 @@ ERROR_CODE_WHITELIST = {
     "auth_flow_failed": "Authentication process failed during OAuth handshake.",
     "max_retries_exceeded": "Maximum authorization retries exceeded.",
 }
+
+
+def _proxy_url_for_oauth(proxy: str) -> str:
+    """Use proxy-side DNS for SOCKS in OAuth requests while preserving its endpoint and credentials."""
+    value = str(proxy or "").strip()
+    try:
+        parts = urlsplit(value)
+        if parts.scheme.lower() == "socks5":
+            return urlunsplit(("socks5h", parts.netloc, parts.path, parts.query, parts.fragment))
+    except ValueError:
+        # Keep validation/error reporting in BrowserSession; do not alter malformed input.
+        pass
+    return value
 
 
 @dataclass(frozen=True)
@@ -142,14 +156,16 @@ class ExistingAccountOAuthSession:
         mail_provider: str | None = None,
     ):
         if not proxy or not str(proxy).strip():
-            raise ValueError("Proxy is strictly required for ExistingAccountOAuthSession (no direct fallback allowed)")
+            logger.warning("[ExistingRunner] Running ExistingAccountOAuthSession without proxy (direct connection).")
+            self.proxy = None
+        else:
+            self.proxy = _proxy_url_for_oauth(str(proxy).strip())
         if not email or not str(email).strip():
             raise ValueError("Email is required")
         if not password:
             raise ValueError("Password is required for existing account runner")
 
         self.email = str(email).strip().lower()
-        self.proxy = str(proxy).strip()
         self.password = str(password)
         self.totp_secret = str(totp_secret).strip() if totp_secret else None
         self.email_otp_callback = email_otp_callback
@@ -161,16 +177,17 @@ class ExistingAccountOAuthSession:
 
         # Create isolated BrowserSession with explicit proxy and detect_exit_geo=False
         self.session = BrowserSession(
-            proxy=self.proxy,
+            proxy=self.proxy or "",
             fingerprint_seed=self.fingerprint_seed,
             detect_exit_geo=False,
         )
 
-        # Enforce that BrowserSession has configured proxies; fail closed if proxy missing
-        configured_proxies = getattr(self.session.session, "proxies", None) or {}
-        if not configured_proxies.get("http") or not configured_proxies.get("https"):
-            self.session.close()
-            raise ValueError("BrowserSession failed to bind configured proxy. Fail-closed: direct connection forbidden.")
+        # Enforce proxy only if configured
+        if self.proxy:
+            configured_proxies = getattr(self.session.session, "proxies", None) or {}
+            if not configured_proxies.get("http") or not configured_proxies.get("https"):
+                self.session.close()
+                raise ValueError("BrowserSession failed to bind configured proxy. Fail-closed: direct connection forbidden.")
 
     def close(self):
         try:
@@ -453,6 +470,7 @@ def run_existing_account_oauth(
     attempt = 0
     phone_used = False
     last_error_code = "auth_flow_failed"
+    failure_phase = "session_init"
 
     while attempt < max_retries:
         attempt += 1
@@ -479,8 +497,26 @@ def run_existing_account_oauth(
                 redacted_error=msg,
                 attempts=attempt,
             )
+        except Exception as exc:
+            # BrowserSession construction can fail for runtime/proxy transport reasons
+            # beyond validation errors. Keep this inside the runner response path so
+            # IPC does not collapse it into an opaque ipc_error/auth_flow_failed.
+            logger.warning(
+                "[ExistingRunner] OAuth attempt failed: phase=session_init exception_type=%s error_code=auth_flow_failed",
+                type(exc).__name__,
+            )
+            code, msg = _get_static_error("auth_flow_failed")
+            return ExistingAccountRunnerResult(
+                ok=False,
+                status="failed",
+                email=mask_identifier(email),
+                error_code=code,
+                redacted_error=msg,
+                attempts=attempt,
+            )
 
         try:
+            failure_phase = "oauth_flow"
             def phone_handler():
                 if not sms_client or not smsfast_config:
                     raise RuntimeError("auth_requires_phone")
@@ -622,6 +658,13 @@ def run_existing_account_oauth(
                 code, msg = _get_static_error("auth_requires_phone")
             else:
                 code, msg = _get_static_error("auth_flow_failed")
+
+            # Keep diagnostics useful without logging exception text, which may contain
+            # account data, proxy credentials, OTPs, or authorization URLs.
+            logger.warning(
+                "[ExistingRunner] OAuth attempt failed: phase=%s exception_type=%s error_code=%s",
+                failure_phase, type(exc).__name__, code,
+            )
 
             return ExistingAccountRunnerResult(
                 ok=False,

@@ -20,6 +20,7 @@ import pytest
 from core.existing_account_runner import (
     ExistingAccountRunnerResult,
     SmsFastRunnerConfig,
+    _proxy_url_for_oauth,
     mask_identifier,
     run_existing_account_oauth,
 )
@@ -50,17 +51,38 @@ def test_smsfast_config_validation():
     assert cfg.service == "dr"
 
 
-def test_proxy_strictly_required_no_direct_fallback():
-    """Proxy cannot be empty or None. Direct fallback must not occur."""
-    res_none = run_existing_account_oauth(
-        email="test@example.com",
-        password="secretpassword",
-        proxy="",
+def test_oauth_proxy_uses_remote_dns_without_changing_proxy_endpoint_or_credentials():
+    assert _proxy_url_for_oauth("socks5://user:pass@proxy.example:1234") == (
+        "socks5h://user:pass@proxy.example:1234"
     )
-    assert res_none.ok is False
-    assert res_none.status == "failed"
-    assert res_none.error_code == "proxy_required"
-    assert res_none.redacted_error == "Proxy configuration is strictly required (direct connection forbidden)."
+    assert _proxy_url_for_oauth("http://user:pass@proxy.example:1234") == (
+        "http://user:pass@proxy.example:1234"
+    )
+
+
+def test_missing_proxy_allows_direct_connection(monkeypatch, caplog):
+    """No assigned proxy is allowed; BrowserSession receives an explicit empty proxy."""
+    from core.existing_account_runner import ExistingAccountOAuthSession
+
+    sessions = []
+
+    class FakeBrowserSession:
+        def __init__(self, **kwargs):
+            sessions.append(kwargs)
+            self.session = MagicMock()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("core.existing_account_runner.BrowserSession", FakeBrowserSession)
+    with caplog.at_level("WARNING", logger="core.existing_account_runner"):
+        session = ExistingAccountOAuthSession(email="test@example.com", password="secretpassword", proxy="")
+    try:
+        assert session.proxy is None
+        assert sessions[0]["proxy"] == ""
+        assert "without proxy (direct connection)" in caplog.text
+    finally:
+        session.close()
 
 
 def test_browser_session_proxy_missing_fails_closed():
@@ -326,3 +348,41 @@ def test_redaction_strict_whitelist_no_raw_exc_or_urls():
         assert "MyPassword456" not in res.redacted_error
         assert "https://" not in res.redacted_error
         assert res.email == "my***@example.com"
+
+
+def test_unexpected_oauth_error_logs_type_only(caplog):
+    """Unexpected runner errors are diagnosable without logging their contents."""
+    import logging
+
+    secret_error = "https://auth.openai.com/?token=secret-value password=secret-password"
+    with patch("core.codex_oauth._bootstrap_authorize", side_effect=RuntimeError(secret_error)):
+        with caplog.at_level(logging.WARNING, logger="core.existing_account_runner"):
+            result = run_existing_account_oauth(
+                email="test@example.com",
+                password="secret-password",
+                proxy="http://proxy:8080",
+            )
+
+    assert result.error_code == "auth_flow_failed"
+    assert "phase=oauth_flow exception_type=RuntimeError" in caplog.text
+    assert "secret-value" not in caplog.text
+    assert "secret-password" not in caplog.text
+    assert "auth.openai.com" not in caplog.text
+
+
+def test_runner_init_error_logs_session_phase(caplog):
+    """Session construction errors are distinguished from OAuth protocol failures."""
+    import logging
+
+    with patch("core.existing_account_runner.BrowserSession", side_effect=OSError("private detail")):
+        with caplog.at_level(logging.WARNING, logger="core.existing_account_runner"):
+            result = run_existing_account_oauth(
+                email="test@example.com",
+                password="secret-password",
+                proxy="socks5://user:password@proxy.example:1234",
+            )
+
+    assert result.error_code == "auth_flow_failed"
+    assert "phase=session_init exception_type=OSError" in caplog.text
+    assert "private detail" not in caplog.text
+    assert "proxy.example" not in caplog.text
