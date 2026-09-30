@@ -53,6 +53,8 @@ ERROR_CODE_WHITELIST = {
     "sms_timeout_unverified_refund": "SMS timeout occurred; refund confirmation cannot be independently verified. Fail closed.",
     "sms_order_failed_reconciliation": "Error occurred after number purchase. Fail closed; reconciliation required.",
     "auth_flow_failed": "Authentication process failed during OAuth handshake.",
+    "chat_unusable": "ChatGPT rejected messages for this account.",
+    "chat_verify_unavailable": "ChatGPT verification could not be completed; account not created.",
     "max_retries_exceeded": "Maximum authorization retries exceeded.",
 }
 
@@ -421,6 +423,7 @@ def run_existing_account_oauth(
     smsfast_config: SmsFastRunnerConfig | None = None,
     email_otp_mode: str = "manual",
     mail_provider: str | None = None,
+    verify_chat: bool = False,
 ) -> ExistingAccountRunnerResult:
     """
     Main entrypoint for existing account OAuth authorization.
@@ -432,6 +435,8 @@ def run_existing_account_oauth(
       import jobs still require a proxy at the Sub2API preflight level.
     - Session isolation: each retry / attempt spins up a brand new BrowserSession with unique fingerprint.
     - Phone purchase only when OpenAI explicitly demands phone verification.
+    - If verify_chat is set (import flow), one minimal ChatGPT message round-trip
+      gates success; message content is never logged.
     - If ANY exception occurs after acquire_number, status=reconciliation_needed and never buys a second number.
     - ACCESS_CANCEL does not prove refund: halts and does not buy another number.
     - Whitelist error_code and static redacted descriptions only (no raw exception strings).
@@ -563,6 +568,42 @@ def run_existing_account_oauth(
                     attempts=attempt,
                     phone_used=phone_used,
                 )
+
+            if verify_chat:
+                from core import chatgpt_verify
+                try:
+                    proof = chatgpt_verify.verify_chat_reply(oauth_session.session, email)
+                    logger.info(
+                        "[ExistingRunner] ChatGPT verification ok: reply_chars=%d",
+                        proof["reply_chars"],
+                    )
+                except AccountUnusableError as exc:
+                    raw_code = getattr(exc, "error_code", "") or "chat_unusable"
+                    code, msg = _get_static_error(raw_code, fallback_code="chat_unusable")
+                    return ExistingAccountRunnerResult(
+                        ok=False,
+                        status="failed",
+                        email=mask_identifier(email),
+                        error_code=code,
+                        redacted_error=msg,
+                        attempts=attempt,
+                        phone_used=phone_used,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[ExistingRunner] ChatGPT verification unavailable: exception_type=%s",
+                        type(exc).__name__,
+                    )
+                    code, msg = _get_static_error("chat_verify_unavailable")
+                    return ExistingAccountRunnerResult(
+                        ok=False,
+                        status="failed",
+                        email=mask_identifier(email),
+                        error_code=code,
+                        redacted_error=msg,
+                        attempts=attempt,
+                        phone_used=phone_used,
+                    )
 
             plan_type = id_claims.get("plan_type") or ""
             storage = codex_oauth.build_codex_storage(tokens, id_claims)

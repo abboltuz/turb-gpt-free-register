@@ -141,6 +141,7 @@ def handle_runner_request(
     totp_secret = req.get("totp_secret")
     email_otp_mode = req.get("email_otp_mode", "manual")
     mail_provider = req.get("mail_provider")
+    verify_chat = bool(req.get("verify_chat", False))
     smsfast_raw = req.get("smsfast_config")
 
     smsfast_cfg: SmsFastRunnerConfig | None = None
@@ -221,6 +222,7 @@ def handle_runner_request(
         smsfast_config=smsfast_cfg,
         email_otp_mode=email_otp_mode,
         mail_provider=mail_provider,
+        verify_chat=verify_chat,
     )
 
     resp: dict[str, Any] = {
