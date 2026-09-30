@@ -61,7 +61,10 @@ class TestExistingAccountIPC(unittest.TestCase):
             first.stop()
 
     def test_ipc_mock_success(self):
+        seen = {}
+
         def mock_runner(email, password, proxy, **kwargs):
+            seen.update(kwargs)
             return ExistingAccountRunnerResult(
                 ok=True,
                 status="success",
@@ -85,6 +88,7 @@ class TestExistingAccountIPC(unittest.TestCase):
                     "email": "user@example.com",
                     "password": "secretpassword",
                     "proxy": "http://127.0.0.1:8080",
+                    "verify_chat": True,
                 },
             )
             resp = read_framed_json(client)
@@ -94,6 +98,7 @@ class TestExistingAccountIPC(unittest.TestCase):
             self.assertEqual(resp.get("account_id"), "acc-12345")
             self.assertIn("tokens", resp)
             self.assertEqual(resp["tokens"]["access_token"], "mock-access-token")
+            self.assertTrue(seen.get("verify_chat"), "verify_chat flag must reach runner_fn")
             client.close()
         finally:
             daemon.stop()
