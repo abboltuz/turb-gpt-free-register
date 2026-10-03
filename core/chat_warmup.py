@@ -30,7 +30,6 @@ EMAIL_SELECTORS = [
     'input[type="email"]',
     'input[name="username"]',
     'input[name="email"]',
-    'input[type="text"]',
 ]
 PASSWORD_SELECTORS = [
     'input[type="password"]',
