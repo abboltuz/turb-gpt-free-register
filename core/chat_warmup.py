@@ -278,13 +278,6 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
             if _chat_ui_present(page):
                 logger.info("[ChatWarmup] already logged in for %s", masked)
                 return
-            email_box = _first_visible_locator(page, EMAIL_SELECTORS, timeout_ms=2000)
-            if email_box and not password_done:
-                logger.info("[ChatWarmup] stage=email for %s", masked)
-                last_stage = "email"
-                _fill_box(page, EMAIL_SELECTORS, email, label="email")
-                _submit_current_form(page)
-                continue
             pwd_box = _first_visible_locator(page, PASSWORD_SELECTORS, timeout_ms=2000)
             if pwd_box:
                 if last_stage != "password":
@@ -311,6 +304,15 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
                     except Exception as exc:
                         raise ChatWarmupUnavailableError(f"TOTP fill failed: {type(exc).__name__}")
                 time.sleep(3.0)
+                continue
+            pwd_now = _first_visible_locator(page, PASSWORD_SELECTORS, timeout_ms=1000)
+            code_now = _first_visible_locator(page, CODE_SELECTORS, timeout_ms=1000)
+            email_box = _first_visible_locator(page, EMAIL_SELECTORS, timeout_ms=2000)
+            if email_box and not password_done and not pwd_now and not code_now:
+                logger.info("[ChatWarmup] stage=email for %s", masked)
+                last_stage = "email"
+                _fill_box(page, EMAIL_SELECTORS, email, label="email")
+                _submit_current_form(page)
                 continue
             code_box = _first_visible_locator(page, CODE_SELECTORS, timeout_ms=2000)
             if code_box and password_done:
