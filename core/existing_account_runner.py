@@ -61,6 +61,7 @@ ERROR_CODE_WHITELIST = {
     "openai_rate_limited": "OpenAI rate-limited authorization requests; cool down before retrying.",
     "chat_unusable": "ChatGPT rejected messages for this account.",
     "chat_verify_unavailable": "ChatGPT verification could not be completed; account not created.",
+    "chat_warmup_unavailable": "ChatGPT web warm-up (login + message before OAuth) could not be completed; account not created.",
     "max_retries_exceeded": "Maximum authorization retries exceeded.",
 }
 
@@ -449,8 +450,12 @@ def run_existing_account_oauth(
     - Session isolation: each attempt uses a fresh BrowserSession. NO_NUMBERS
       falls through to other selected countries within that same session.
     - Phone purchase only when OpenAI explicitly demands phone verification.
-    - If verify_chat is set (import flow), one minimal ChatGPT message round-trip
-      gates success; message content is never logged.
+    - If verify_chat is set (import flow), a web warm-up (real browser login
+      on chatgpt.com + one message round-trip) runs FIRST, because a fresh
+      account receives no verification SMS without prior chat activity.
+      Warm-up runs before any OAuth attempt and before any SMSFast purchase,
+      so its failure costs nothing. The post-OAuth ChatGPT message round-trip
+      remains as the creation gate.
     - If ANY exception occurs after acquire_number, status=reconciliation_needed and never buys a second number.
     - ACCESS_CANCEL does not prove refund: halts and does not buy another number.
     - Whitelist error_code and static redacted descriptions only (no raw exception strings).
@@ -476,6 +481,37 @@ def run_existing_account_oauth(
 
     max_retries = smsfast_config.max_retries_per_run if smsfast_config else 1
     countries = list(dict.fromkeys(smsfast_config.countries)) if smsfast_config else []
+
+    # Import-only web warm-up before any OAuth/SMS activity (no purchase yet).
+    if verify_chat:
+        from core import chat_warmup
+        try:
+            proof = chat_warmup.warmup_chat_before_oauth(
+                email=email,
+                password=password,
+                proxy=proxy,
+                totp_secret=totp_secret,
+                email_otp_callback=email_otp_callback,
+            )
+            logger.info(
+                "[ExistingRunner] ChatGPT warm-up ok: reply_chars=%d",
+                proof["reply_chars"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "[ExistingRunner] ChatGPT warm-up unavailable: exception_type=%s",
+                type(exc).__name__,
+            )
+            code, msg = _get_static_error("chat_warmup_unavailable")
+            return ExistingAccountRunnerResult(
+                ok=False,
+                status="failed",
+                email=mask_identifier(email),
+                error_code=code,
+                redacted_error=msg,
+                attempts=0,
+                phone_used=False,
+            )
 
     sms_client: SmsFastClient | None = None
     if smsfast_config:

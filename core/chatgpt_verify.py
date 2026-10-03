@@ -5,8 +5,10 @@ Post-OAuth ChatGPT verification: one message + assistant reply as account proof.
 Runs AFTER the OAuth login on the same authenticated BrowserSession and BEFORE
 any account record is created. A single minimal message is sent through
 ChatGPT's own backend API; only the fact of the reply (never its content) is
-recorded. This is a verification gate, not warming: it cannot influence token
-issuance, it only permits or blocks account creation.
+recorded. As a post-OAuth step this is a verification gate, not warming: it
+only permits or blocks account creation. The same message round-trip is also
+reused by core.chat_warmup BEFORE OAuth as account warm-up, which
+empirically makes the later verification SMS deliverable.
 
 Outcomes:
   - ok: assistant reply received -> {"conversation_id": ..., "reply_chars": N}
