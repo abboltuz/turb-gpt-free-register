@@ -123,17 +123,21 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
     except Exception as exc:
         raise ChatWarmupUnavailableError(f"login page navigation failed: {type(exc).__name__}")
+    logger.info("[ChatWarmup] login page loaded for %s", masked)
     _settle_challenge(page)
 
     deadline = time.time() + LOGIN_TIMEOUT
     otp_after_ts = time.time()
     password_done = False
+    last_stage = ""
     while time.time() < deadline:
         if _chat_ui_present(page):
             logger.info("[ChatWarmup] already logged in for %s", masked)
             return
         email_box = _first_visible_locator(page, EMAIL_SELECTORS, timeout_ms=2000)
         if email_box and not password_done:
+            logger.info("[ChatWarmup] stage=email for %s", masked)
+            last_stage = "email"
             try:
                 email_box.fill(email, timeout=10000)
             except Exception as exc:
@@ -148,6 +152,9 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
             continue
         pwd_box = _first_visible_locator(page, PASSWORD_SELECTORS, timeout_ms=2000)
         if pwd_box:
+            if last_stage != "password":
+                logger.info("[ChatWarmup] stage=password for %s", masked)
+                last_stage = "password"
             try:
                 pwd_box.fill(password, timeout=10000)
             except Exception as exc:
@@ -180,6 +187,9 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
             continue
         code_box = _first_visible_locator(page, CODE_SELECTORS, timeout_ms=2000)
         if code_box and password_done:
+            if last_stage != "code":
+                logger.info("[ChatWarmup] stage=code for %s", masked)
+                last_stage = "code"
             if email_otp_callback is None:
                 raise ChatWarmupUnavailableError("email OTP required but no callback")
             try:
@@ -255,8 +265,11 @@ def warmup_chat_before_oauth(
     driver = None
     try:
         from core.cloakbrowser_driver import build_cloak_driver
+        logger.info("[ChatWarmup] launching browser for %s", masked)
         driver, _ = build_cloak_driver(proxy=proxy)
+        logger.info("[ChatWarmup] browser ready, opening login for %s", masked)
         _web_login(driver.page, email, password, totp_secret, email_otp_callback)
+        logger.info("[ChatWarmup] web login done for %s, waiting for chat UI", masked)
         try:
             driver.page.wait_for_function(
                 "() => !!document.querySelector('#prompt-textarea,textarea,div[contenteditable=\"true\"]')",

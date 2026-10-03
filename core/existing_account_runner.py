@@ -498,9 +498,11 @@ def run_existing_account_oauth(
                 proof["reply_chars"],
             )
         except Exception as exc:
+            # ChatWarmupUnavailableError messages carry only stage names and
+            # exception type names (no credentials, cookies or codes).
             logger.warning(
-                "[ExistingRunner] ChatGPT warm-up unavailable: exception_type=%s",
-                type(exc).__name__,
+                "[ExistingRunner] ChatGPT warm-up unavailable: exception_type=%s detail=%s",
+                type(exc).__name__, str(exc)[:160],
             )
             code, msg = _get_static_error("chat_warmup_unavailable")
             return ExistingAccountRunnerResult(
