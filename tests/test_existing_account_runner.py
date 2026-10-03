@@ -20,6 +20,7 @@ import pytest
 from core.existing_account_runner import (
     ExistingAccountRunnerResult,
     SmsFastRunnerConfig,
+    _handle_phone_with_smsfast,
     _proxy_url_for_oauth,
     mask_identifier,
     run_existing_account_oauth,
@@ -368,6 +369,7 @@ def test_exception_after_acquire_halts_no_second_get_number():
 
     # Simulate OpenAI rejecting phone on add-phone/send
     with patch("core.existing_account_runner.SmsFastClient", return_value=mock_sms_client), \
+         patch("core.existing_account_runner.SMSFAST_MIN_CANCEL_AGE", 0), \
          patch("core.codex_oauth._bootstrap_authorize"), \
          patch("core.codex_oauth._submit_email", return_value={"page": {"type": "password"}}), \
          patch("core.codex_oauth._is_password_step", return_value=True), \
@@ -393,6 +395,28 @@ def test_exception_after_acquire_halts_no_second_get_number():
         assert res.reconciliation_data is not None
         assert res.reconciliation_data["activation_id"] == "act_45678"
         assert res.error_code in ("sms_timeout_unverified_refund", "sms_order_failed_reconciliation")
+
+
+def test_phone_rejection_waits_two_minutes_before_cancelling():
+    client = MagicMock()
+    client.acquire_number.return_value = ("1234567", "521234567890")
+    clock = [1000.0]
+    def sleep(seconds):
+        clock[0] += seconds
+
+    def cancel(_activation_id):
+        assert clock[0] >= 1125.0
+        return True
+
+    client.cancel_and_verify.side_effect = cancel
+    with patch("core.existing_account_runner.time.monotonic", side_effect=lambda: clock[0]), \
+         patch("core.existing_account_runner.time.sleep", side_effect=sleep), \
+         patch("core.codex_oauth._post_json", return_value=MagicMock(status_code=400)), \
+         patch("core.codex_oauth._response_text", return_value=""), \
+         patch("core.codex_oauth._phone_failure_reason", return_value="invalid_phone"):
+        with pytest.raises(Exception, match="OpenAI rejected phone number"):
+            _handle_phone_with_smsfast(MagicMock(), client, "54", "dr", "4000", 180, 5)
+    client.cancel_and_verify.assert_called_once_with("1234567")
 
 
 def test_sms_timeout_halts_and_requires_reconciliation():

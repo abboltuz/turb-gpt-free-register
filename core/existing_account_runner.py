@@ -28,6 +28,7 @@ from core.smsfast_provider import (
 )
 
 logger = logging.getLogger(__name__)
+SMSFAST_MIN_CANCEL_AGE = 125  # SMSFast rejects cancellation within two minutes; allow clock/API margin.
 
 # ---------------------------------------------------------------------------
 # Whitelist of typed error codes and safe static descriptions
@@ -332,6 +333,13 @@ def _handle_phone_with_smsfast(
         country=country,
         max_price=max_price,
     )
+    acquired_at = time.monotonic()
+
+    def cancel_activation() -> None:
+        remaining = SMSFAST_MIN_CANCEL_AGE - (time.monotonic() - acquired_at)
+        if remaining > 0:
+            time.sleep(remaining)
+        sms_client.cancel_and_verify(activation_id)
 
     masked_phone = mask_identifier(phone)
     logger.info(f"[SMSFast] Acquired number {masked_phone} for activation {mask_identifier(activation_id)}")
@@ -351,7 +359,7 @@ def _handle_phone_with_smsfast(
         if send_resp.status_code not in (200, 204) or send_reason:
             logger.warning(f"[SMSFast] add-phone/send rejected; cancelling activation {mask_identifier(activation_id)}")
             try:
-                sms_client.cancel_and_verify(activation_id)
+                cancel_activation()
             except Exception:
                 pass
             # ACCESS_CANCEL does not prove refund in current API contract.
@@ -379,7 +387,7 @@ def _handle_phone_with_smsfast(
         if not code:
             logger.warning(f"[SMSFast] Timeout waiting for SMS ({timeout}s). Cancelling activation {mask_identifier(activation_id)}.")
             try:
-                sms_client.cancel_and_verify(activation_id)
+                cancel_activation()
             except Exception:
                 pass
             # Fail closed: cancellation acknowledged, but refund unverified.
@@ -394,7 +402,7 @@ def _handle_phone_with_smsfast(
         )
         if val_resp.status_code not in (200, 204):
             try:
-                sms_client.cancel_and_verify(activation_id)
+                cancel_activation()
             except Exception:
                 pass
             raise _PostAcquireError("OpenAI rejected phone OTP validate", activation_id, phone, is_unverified_refund=True)
@@ -413,7 +421,7 @@ def _handle_phone_with_smsfast(
     except Exception as exc:
         # Any unexpected error after acquire_number must be tracked with activation_id
         try:
-            sms_client.cancel_and_verify(activation_id)
+            cancel_activation()
         except Exception:
             pass
         raise _PostAcquireError(f"Post-acquire error: {type(exc).__name__}", activation_id, phone) from exc
