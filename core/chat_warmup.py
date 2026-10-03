@@ -68,9 +68,12 @@ def _fill_box(page, selectors: list[str], value: str, *, timeout_ms: int = 15000
     box = _first_visible_locator(page, selectors, timeout_ms=2000)
     if box is None:
         raise ChatWarmupUnavailableError(f"{label}: input not found{page_snapshot(page)}")
+    start_url = _page_url(page)
     deadline = time.time() + max(1.0, timeout_ms / 1000.0)
     last_exc: Exception | None = None
     while time.time() < deadline:
+        if _page_url(page) != start_url:
+            raise _PageAdvanced(_page_url(page))
         try:
             if box.is_editable():
                 try:
@@ -97,6 +100,21 @@ def _fill_box(page, selectors: list[str], value: str, *, timeout_ms: int = 15000
         f"{label}: input not fillable: "
         f"{type(last_exc).__name__ if last_exc else 'timeout'}{page_snapshot(page)}"
     )
+
+
+class _PageAdvanced(Exception):
+    """Raised when the page navigates away mid-fill; the loop must re-detect the stage."""
+
+    def __init__(self, url: str):
+        super().__init__(f"page advanced to {url[:80]}")
+        self.url = url
+
+
+def _page_url(page) -> str:
+    try:
+        return str(page.url or "")
+    except Exception:
+        return ""
 
 
 def page_snapshot(page) -> str:
@@ -248,59 +266,66 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
     password_done = False
     last_stage = ""
     while time.time() < deadline:
-        if _chat_ui_present(page):
-            logger.info("[ChatWarmup] already logged in for %s", masked)
-            return
-        email_box = _first_visible_locator(page, EMAIL_SELECTORS, timeout_ms=2000)
-        if email_box and not password_done:
-            logger.info("[ChatWarmup] stage=email for %s", masked)
-            last_stage = "email"
-            _fill_box(page, EMAIL_SELECTORS, email, label="email")
-            _submit_current_form(page)
-            continue
-        pwd_box = _first_visible_locator(page, PASSWORD_SELECTORS, timeout_ms=2000)
-        if pwd_box:
-            if last_stage != "password":
-                logger.info("[ChatWarmup] stage=password for %s", masked)
-                last_stage = "password"
-            try:
-                _fill_box(page, PASSWORD_SELECTORS, password, label="password")
-            except Exception as exc:
-                raise ChatWarmupUnavailableError(f"password fill failed: {type(exc).__name__}")
-            _submit_current_form(page)
-            password_done = True
-            # Optional TOTP on the same or next screen.
-            if totp_secret:
+        try:
+            if _chat_ui_present(page):
+                logger.info("[ChatWarmup] already logged in for %s", masked)
+                return
+            email_box = _first_visible_locator(page, EMAIL_SELECTORS, timeout_ms=2000)
+            if email_box and not password_done:
+                logger.info("[ChatWarmup] stage=email for %s", masked)
+                last_stage = "email"
+                _fill_box(page, EMAIL_SELECTORS, email, label="email")
+                _submit_current_form(page)
+                continue
+            pwd_box = _first_visible_locator(page, PASSWORD_SELECTORS, timeout_ms=2000)
+            if pwd_box:
+                if last_stage != "password":
+                    logger.info("[ChatWarmup] stage=password for %s", masked)
+                    last_stage = "password"
                 try:
-                    import pyotp
-                    if _first_visible_locator(page, CODE_SELECTORS, timeout_ms=12000):
-                        _fill_box(page, CODE_SELECTORS, pyotp.TOTP(str(totp_secret).strip()).now(),
-                                  timeout_ms=20000, label="totp")
-                        _submit_current_form(page)
-                except ChatWarmupUnavailableError:
+                    _fill_box(page, PASSWORD_SELECTORS, password, label="password")
+                except _PageAdvanced:
                     raise
                 except Exception as exc:
-                    raise ChatWarmupUnavailableError(f"TOTP fill failed: {type(exc).__name__}")
-            time.sleep(3.0)
+                    raise ChatWarmupUnavailableError(f"password fill failed: {type(exc).__name__}")
+                _submit_current_form(page)
+                password_done = True
+                # Optional TOTP on the same or next screen.
+                if totp_secret:
+                    try:
+                        import pyotp
+                        if _first_visible_locator(page, CODE_SELECTORS, timeout_ms=12000):
+                            _fill_box(page, CODE_SELECTORS, pyotp.TOTP(str(totp_secret).strip()).now(),
+                                      timeout_ms=20000, label="totp")
+                            _submit_current_form(page)
+                    except (_PageAdvanced, ChatWarmupUnavailableError):
+                        raise
+                    except Exception as exc:
+                        raise ChatWarmupUnavailableError(f"TOTP fill failed: {type(exc).__name__}")
+                time.sleep(3.0)
+                continue
+            code_box = _first_visible_locator(page, CODE_SELECTORS, timeout_ms=2000)
+            if code_box and password_done:
+                if last_stage != "code":
+                    logger.info("[ChatWarmup] stage=code for %s", masked)
+                    last_stage = "code"
+                if email_otp_callback is None:
+                    raise ChatWarmupUnavailableError("email OTP required but no callback")
+                try:
+                    otp = email_otp_callback(email, otp_after_ts)
+                except Exception as exc:
+                    raise ChatWarmupUnavailableError(f"email OTP callback failed: {type(exc).__name__}")
+                try:
+                    _fill_box(page, CODE_SELECTORS, str(otp).strip(), label="email-otp")
+                except _PageAdvanced:
+                    raise
+                except Exception as exc:
+                    raise ChatWarmupUnavailableError(f"OTP fill failed: {type(exc).__name__}")
+                _submit_current_form(page)
+                continue
+            time.sleep(2.0)
+        except _PageAdvanced:
             continue
-        code_box = _first_visible_locator(page, CODE_SELECTORS, timeout_ms=2000)
-        if code_box and password_done:
-            if last_stage != "code":
-                logger.info("[ChatWarmup] stage=code for %s", masked)
-                last_stage = "code"
-            if email_otp_callback is None:
-                raise ChatWarmupUnavailableError("email OTP required but no callback")
-            try:
-                otp = email_otp_callback(email, otp_after_ts)
-            except Exception as exc:
-                raise ChatWarmupUnavailableError(f"email OTP callback failed: {type(exc).__name__}")
-            try:
-                _fill_box(page, CODE_SELECTORS, str(otp).strip(), label="email-otp")
-            except Exception as exc:
-                raise ChatWarmupUnavailableError(f"OTP fill failed: {type(exc).__name__}")
-            _submit_current_form(page)
-            continue
-        time.sleep(2.0)
     raise ChatWarmupUnavailableError("login did not complete in time")
 
 

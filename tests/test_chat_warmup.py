@@ -115,6 +115,27 @@ def test_chat_ui_present_only_in_chat_stage():
     assert chat_warmup._chat_ui_present(page) is True
 
 
+def test_fill_aborts_when_page_advances(monkeypatch):
+    page = FakePage()
+    urls = ["https://chatgpt.com/auth/login", "https://auth.openai.com/log-in/password"]
+    page.url = urls[0]
+
+    orig_editable = FakeLocator.is_editable
+    calls = {"n": 0}
+
+    def flaky_editable(self):
+        calls["n"] += 1
+        if calls["n"] > 2:
+            page.url = urls[1]
+        return False
+
+    monkeypatch.setattr(FakeLocator, "is_editable", flaky_editable)
+    monkeypatch.setattr(chat_warmup.time, "sleep", lambda s: None)
+    with pytest.raises(chat_warmup._PageAdvanced):
+        chat_warmup._fill_box(page, chat_warmup.EMAIL_SELECTORS, "x", label="email", timeout_ms=5000)
+    monkeypatch.setattr(FakeLocator, "is_editable", orig_editable)
+
+
 def test_web_login_happy_path_password_only(monkeypatch):
     page = FakePage()
 
