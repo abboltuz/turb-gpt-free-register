@@ -37,6 +37,12 @@ class FakeLocator:
     def is_visible(self):
         return self._visible
 
+    def is_enabled(self):
+        return self._visible
+
+    def is_editable(self):
+        return self._visible
+
     def fill(self, value, timeout=10000):
         self.filled.append(value)
 
@@ -59,6 +65,9 @@ class FakeKeyboard:
 
     def press(self, key):
         self.page.keys.append(key)
+
+    def type(self, value, delay=20):
+        self.page.keys.append("type:" + str(len(str(value))))
 
 
 class FakePage:
