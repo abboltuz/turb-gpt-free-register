@@ -54,24 +54,28 @@ class ChatWarmupUnavailableError(RuntimeError):
     """Warm-up could not be completed (honest unknown, fail closed)."""
 
 
-def _fill_box(page, selectors: list[str], value: str, *, timeout_ms: int = 15000,
+def _fill_box(page, selectors: list[str], value: str, *, timeout_ms: int = 25000,
               label: str = "input") -> None:
     """Fill the first visible input, waiting until it is editable.
 
-    The login pages hydrate via React: an input can be visible but
-    temporarily readonly/disabled. Wait for editable, click to focus,
-    then fill; fall back to keyboard typing. Raises
-    ChatWarmupUnavailableError when nothing becomes fillable.
+    The login pages hydrate via React and occasionally sit behind
+    Cloudflare Turnstile: wait up to timeout_ms for an input to appear
+    and become editable. Wait for editable, click to focus, then fill;
+    fall back to keyboard typing. Raises ChatWarmupUnavailableError
+    when nothing becomes fillable.
     """
-    box = _first_visible_locator(page, selectors, timeout_ms=2000)
-    if box is None:
-        raise ChatWarmupUnavailableError(f"{label}: input not found{page_snapshot(page)}")
     start_url = _page_url(page)
     deadline = time.time() + max(1.0, timeout_ms / 1000.0)
     last_exc: Exception | None = None
+    box = None
     while time.time() < deadline:
         if _page_url(page) != start_url:
             raise _PageAdvanced(_page_url(page))
+        if box is None:
+            box = _first_visible_locator(page, selectors, timeout_ms=1000)
+        if box is None:
+            time.sleep(1.0)
+            continue
         try:
             if box.count() == 0:
                 # The input vanished (stage transitioned mid-wait): re-detect.
@@ -162,11 +166,27 @@ def _first_visible_locator(page, selectors: list[str], timeout_ms: int = 3000):
 
 
 def _click_continue(page) -> bool:
-    """Click a Continue/Verify-style button; True if one was clicked."""
+    """Click the primary Continue/Verify button; True if one was clicked.
+
+    Matches the exact button text (e.g. 'Continue', 'Log in'), explicitly
+    skipping third-party options like 'Continue with Google' or 'Continue with Apple'.
+    """
     try:
         buttons = page.locator('button[type="submit"], button').all()
     except Exception:
         return False
+    # Priority 1: type="submit" whose trimmed text exactly matches one of the targets
+    for btn in buttons:
+        try:
+            if not btn.is_visible() or btn.get_attribute("type") != "submit":
+                continue
+            text = (btn.inner_text(timeout=1000) or "").strip().lower()
+            if text in CONTINUE_TEXTS:
+                btn.click(timeout=5000)
+                return True
+        except Exception:
+            continue
+    # Priority 2: any visible button whose trimmed text exactly matches
     for btn in buttons:
         try:
             if not btn.is_visible():
@@ -348,6 +368,7 @@ SEND_BUTTON_SELECTORS = [
     'button[aria-label*="Отправить" i]',
 ]
 ASSISTANT_TURN_SELECTORS = [
+    '[data-message-author-role="assistant"]',
     'div[data-message-author-role="assistant"]',
     '[data-testid^="conversation-turn-"]',
     ".markdown",
@@ -393,7 +414,11 @@ def _browser_send_and_wait_reply(page, reply_timeout: float = 150) -> int:
     try:
         composer.click(timeout=5000)
         time.sleep(0.5)
-        composer.fill("ping", timeout=10000)
+        try:
+            composer.fill("ping", timeout=4000)
+        except Exception:
+            # contenteditable divs cannot always be .fill()ed; keyboard.type is universal
+            page.keyboard.type("ping", delay=50)
     except Exception as exc:
         raise ChatWarmupUnavailableError(f"composer fill failed: {type(exc).__name__}")
     time.sleep(1.0)
