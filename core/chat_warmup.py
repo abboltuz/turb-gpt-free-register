@@ -75,6 +75,14 @@ def _fill_box(page, selectors: list[str], value: str, *, timeout_ms: int = 15000
         if _page_url(page) != start_url:
             raise _PageAdvanced(_page_url(page))
         try:
+            if box.count() == 0:
+                # The input vanished (stage transitioned mid-wait): re-detect.
+                raise _PageAdvanced(_page_url(page))
+        except _PageAdvanced:
+            raise
+        except Exception as exc:
+            last_exc = exc
+        try:
             if box.is_editable():
                 try:
                     box.click(timeout=3000)
