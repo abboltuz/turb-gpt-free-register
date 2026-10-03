@@ -349,6 +349,8 @@ SEND_BUTTON_SELECTORS = [
 ]
 ASSISTANT_TURN_SELECTORS = [
     'div[data-message-author-role="assistant"]',
+    '[data-testid^="conversation-turn-"]',
+    ".markdown",
     "article",
 ]
 MODAL_DISMISS_TEXTS = ("skip", "not now", "continue", "got it", "maybe later", "dismiss")
@@ -437,7 +439,17 @@ def _browser_send_and_wait_reply(page, reply_timeout: float = 150) -> int:
             stable_rounds = 0
             last_len = len(text)
         time.sleep(5.0)
-    raise ChatWarmupUnavailableError("assistant reply timeout")
+    try:
+        url_now = str(page.url or "")[:80]
+    except Exception:
+        url_now = "?"
+    diag_parts = []
+    for sel in ASSISTANT_TURN_SELECTORS:
+        try:
+            diag_parts.append(f"{sel}={page.locator(sel).count()}")
+        except Exception:
+            diag_parts.append(f"{sel}=?")
+    raise ChatWarmupUnavailableError(f"assistant reply timeout | url={url_now} {' '.join(diag_parts)}")
 
 
 def warmup_chat_before_oauth(
