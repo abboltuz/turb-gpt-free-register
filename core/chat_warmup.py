@@ -200,6 +200,38 @@ def _settle_challenge(page, timeout_s: int = 60) -> None:
         time.sleep(4.0)
 
 
+def _submit_current_form(page) -> None:
+    """Click Continue/Verify or press Enter, then wait for the page to advance."""
+    try:
+        prev_url = str(page.url or "")
+    except Exception:
+        prev_url = ""
+    if not _click_continue(page):
+        try:
+            page.keyboard.press("Enter")
+        except Exception:
+            pass
+    _wait_for_page_advance(page, prev_url)
+
+
+def _wait_for_page_advance(page, prev_url: str, timeout_s: int = 20) -> None:
+    """Wait until navigation away from the submitted form starts."""
+    deadline = time.time() + max(1, timeout_s)
+    while time.time() < deadline:
+        try:
+            if str(page.url or "") != prev_url:
+                time.sleep(2.0)  # let the new page hydrate
+                return
+        except Exception:
+            return
+        try:
+            if _chat_ui_present(page):
+                return
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+
 def _web_login(page, email: str, password: str, totp_secret: str | None,
                email_otp_callback: Callable[[str, float], str] | None) -> None:
     """Full web login on chatgpt.com. Raises ChatWarmupUnavailableError."""
@@ -224,13 +256,7 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
             logger.info("[ChatWarmup] stage=email for %s", masked)
             last_stage = "email"
             _fill_box(page, EMAIL_SELECTORS, email, label="email")
-            time.sleep(1.0)
-            if not _click_continue(page):
-                try:
-                    page.keyboard.press("Enter")
-                except Exception:
-                    pass
-            time.sleep(3.0)
+            _submit_current_form(page)
             continue
         pwd_box = _first_visible_locator(page, PASSWORD_SELECTORS, timeout_ms=2000)
         if pwd_box:
@@ -241,12 +267,7 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
                 _fill_box(page, PASSWORD_SELECTORS, password, label="password")
             except Exception as exc:
                 raise ChatWarmupUnavailableError(f"password fill failed: {type(exc).__name__}")
-            time.sleep(1.0)
-            if not _click_continue(page):
-                try:
-                    page.keyboard.press("Enter")
-                except Exception:
-                    pass
+            _submit_current_form(page)
             password_done = True
             # Optional TOTP on the same or next screen.
             if totp_secret:
@@ -255,12 +276,7 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
                     if _first_visible_locator(page, CODE_SELECTORS, timeout_ms=12000):
                         _fill_box(page, CODE_SELECTORS, pyotp.TOTP(str(totp_secret).strip()).now(),
                                   timeout_ms=20000, label="totp")
-                        time.sleep(1.0)
-                        if not _click_continue(page):
-                            try:
-                                page.keyboard.press("Enter")
-                            except Exception:
-                                pass
+                        _submit_current_form(page)
                 except ChatWarmupUnavailableError:
                     raise
                 except Exception as exc:
@@ -282,13 +298,7 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
                 _fill_box(page, CODE_SELECTORS, str(otp).strip(), label="email-otp")
             except Exception as exc:
                 raise ChatWarmupUnavailableError(f"OTP fill failed: {type(exc).__name__}")
-            time.sleep(1.0)
-            if not _click_continue(page):
-                try:
-                    page.keyboard.press("Enter")
-                except Exception:
-                    pass
-            time.sleep(3.0)
+            _submit_current_form(page)
             continue
         time.sleep(2.0)
     raise ChatWarmupUnavailableError("login did not complete in time")

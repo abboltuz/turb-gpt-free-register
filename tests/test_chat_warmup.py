@@ -118,13 +118,14 @@ def test_chat_ui_present_only_in_chat_stage():
 def test_web_login_happy_path_password_only(monkeypatch):
     page = FakePage()
 
-    def advance_sleep(seconds):
+    def fake_advance(pg, prev_url="", timeout_s=20):
         if page.stage == "email" and page.clicked:
             page.stage = "password"
         elif page.stage == "password" and page.clicked:
             page.stage = "chat"
 
-    monkeypatch.setattr(chat_warmup.time, "sleep", advance_sleep)
+    monkeypatch.setattr(chat_warmup.time, "sleep", lambda s: None)
+    monkeypatch.setattr(chat_warmup, "_wait_for_page_advance", fake_advance)
     chat_warmup._web_login(page, "test@example.com", "secretpassword", None, None)
     assert page.goto_urls and page.goto_urls[0].startswith("https://chatgpt.com/")
     assert page.clicked, "Continue must have been clicked"
