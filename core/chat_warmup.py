@@ -56,7 +56,8 @@ class ChatWarmupUnavailableError(RuntimeError):
     """Warm-up could not be completed (honest unknown, fail closed)."""
 
 
-def _fill_box(page, selectors: list[str], value: str, *, timeout_ms: int = 15000) -> None:
+def _fill_box(page, selectors: list[str], value: str, *, timeout_ms: int = 15000,
+              label: str = "input") -> None:
     """Fill the first visible input, waiting until it is editable.
 
     The login pages hydrate via React: an input can be visible but
@@ -66,7 +67,7 @@ def _fill_box(page, selectors: list[str], value: str, *, timeout_ms: int = 15000
     """
     box = _first_visible_locator(page, selectors, timeout_ms=2000)
     if box is None:
-        raise ChatWarmupUnavailableError("input not found")
+        raise ChatWarmupUnavailableError(f"{label}: input not found{page_snapshot(page)}")
     deadline = time.time() + max(1.0, timeout_ms / 1000.0)
     last_exc: Exception | None = None
     while time.time() < deadline:
@@ -92,7 +93,36 @@ def _fill_box(page, selectors: list[str], value: str, *, timeout_ms: int = 15000
         except Exception as exc:
             last_exc = exc
         time.sleep(1.0)
-    raise ChatWarmupUnavailableError(f"input not fillable: {type(last_exc).__name__ if last_exc else 'timeout'}")
+    raise ChatWarmupUnavailableError(
+        f"{label}: input not fillable: "
+        f"{type(last_exc).__name__ if last_exc else 'timeout'}{page_snapshot(page)}"
+    )
+
+
+def page_snapshot(page) -> str:
+    """One-line safe page summary: title, URL path and input states only."""
+    try:
+        title = str(page.title() or "")[:60]
+    except Exception:
+        title = "?"
+    try:
+        url = str(page.url or "")[:100]
+    except Exception:
+        url = "?"
+    parts = []
+    for name, sels in (("email", EMAIL_SELECTORS), ("pwd", PASSWORD_SELECTORS), ("code", CODE_SELECTORS)):
+        try:
+            locs = page.locator(sels[0]).all()
+            states = []
+            for loc in locs[:3]:
+                try:
+                    states.append(f"v={int(loc.is_visible())}e={int(loc.is_enabled())}w={int(loc.is_editable())}")
+                except Exception:
+                    states.append("?")
+            parts.append(f"{name}n={len(locs)}[{','.join(states)}]")
+        except Exception:
+            parts.append(f"{name}n=?")
+    return f" | title={title} url={url} {' '.join(parts)}"
 
 
 def _first_visible_locator(page, selectors: list[str], timeout_ms: int = 3000):
@@ -177,7 +207,7 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
         if email_box and not password_done:
             logger.info("[ChatWarmup] stage=email for %s", masked)
             last_stage = "email"
-            _fill_box(page, EMAIL_SELECTORS, email)
+            _fill_box(page, EMAIL_SELECTORS, email, label="email")
             time.sleep(1.0)
             if not _click_continue(page):
                 try:
@@ -192,7 +222,7 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
                 logger.info("[ChatWarmup] stage=password for %s", masked)
                 last_stage = "password"
             try:
-                _fill_box(page, PASSWORD_SELECTORS, password)
+                _fill_box(page, PASSWORD_SELECTORS, password, label="password")
             except Exception as exc:
                 raise ChatWarmupUnavailableError(f"password fill failed: {type(exc).__name__}")
             time.sleep(1.0)
@@ -208,7 +238,7 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
                     import pyotp
                     if _first_visible_locator(page, CODE_SELECTORS, timeout_ms=12000):
                         _fill_box(page, CODE_SELECTORS, pyotp.TOTP(str(totp_secret).strip()).now(),
-                                  timeout_ms=20000)
+                                  timeout_ms=20000, label="totp")
                         time.sleep(1.0)
                         if not _click_continue(page):
                             try:
@@ -233,7 +263,7 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
             except Exception as exc:
                 raise ChatWarmupUnavailableError(f"email OTP callback failed: {type(exc).__name__}")
             try:
-                _fill_box(page, CODE_SELECTORS, str(otp).strip())
+                _fill_box(page, CODE_SELECTORS, str(otp).strip(), label="email-otp")
             except Exception as exc:
                 raise ChatWarmupUnavailableError(f"OTP fill failed: {type(exc).__name__}")
             time.sleep(1.0)

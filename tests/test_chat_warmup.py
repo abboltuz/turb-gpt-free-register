@@ -80,9 +80,14 @@ class FakePage:
         self.keyboard = FakeKeyboard(self)
         self.button_text = "Continue"
         self.goto_urls = []
+        self.url = ""
 
     def goto(self, url, wait_until="domcontentloaded", timeout=45000):
         self.goto_urls.append(url)
+        self.url = url
+
+    def title(self):
+        return "fake"
 
     def locator(self, selector):
         if selector in chat_warmup.EMAIL_SELECTORS:
