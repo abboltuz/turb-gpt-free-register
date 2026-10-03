@@ -167,21 +167,37 @@ def _chat_ui_present(page) -> bool:
     return False
 
 
-def _settle_challenge(page, timeout_s: int = 30) -> None:
-    """Give a Cloudflare Turnstile checkbox a chance to clear."""
+def _settle_challenge(page, timeout_s: int = 60) -> None:
+    """Give a Cloudflare challenge a chance to clear.
+
+    Returns early when the email input is not just visible but editable,
+    or when the chat UI is already present. Otherwise nudges a possible
+    Turnstile checkbox with Tab/Space.
+    """
     deadline = time.time() + max(0, timeout_s)
     while time.time() < deadline:
-        if _first_visible_locator(page, EMAIL_SELECTORS, timeout_ms=2000):
-            return
+        box = _first_visible_locator(page, EMAIL_SELECTORS, timeout_ms=2000)
+        if box is not None:
+            try:
+                if box.is_editable():
+                    return
+            except Exception:
+                pass
         if _chat_ui_present(page):
             return
+        try:
+            title = str(page.title() or "").lower()
+        except Exception:
+            title = ""
+        if "geduld" in title or "just a moment" in title or "verify you are human" in title:
+            logger.info("[ChatWarmup] challenge page present, nudging checkbox")
         try:
             page.keyboard.press("Tab")
             time.sleep(0.3)
             page.keyboard.press("Space")
         except Exception:
             pass
-        time.sleep(2.0)
+        time.sleep(4.0)
 
 
 def _web_login(page, email: str, password: str, totp_secret: str | None,
