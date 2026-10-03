@@ -90,6 +90,8 @@ class FakePage:
         return "fake"
 
     def locator(self, selector):
+        if "send-button" in selector:
+            return FakeLocator(self, selector, visible=True)
         if selector in chat_warmup.EMAIL_SELECTORS:
             return FakeLocator(self, selector, visible=(self.stage == "email"))
         if selector in chat_warmup.PASSWORD_SELECTORS:
@@ -134,6 +136,35 @@ def test_fill_aborts_when_page_advances(monkeypatch):
     with pytest.raises(chat_warmup._PageAdvanced):
         chat_warmup._fill_box(page, chat_warmup.EMAIL_SELECTORS, "x", label="email", timeout_ms=5000)
     monkeypatch.setattr(FakeLocator, "is_editable", orig_editable)
+
+
+def test_browser_send_and_wait_reply(monkeypatch):
+    page = FakePage()
+    page.stage = "chat"
+    page.button_text = "Send"
+
+    article = FakeLocator(page, "article", visible=True)
+
+    orig_locator = FakePage.locator
+
+    def locator(self, selector):
+        if selector in chat_warmup.ASSISTANT_TURN_SELECTORS:
+            return article
+        return orig_locator(self, selector)
+
+    monkeypatch.setattr(FakePage, "locator", locator)
+    monkeypatch.setattr(chat_warmup.time, "sleep", lambda s: None)
+    n = chat_warmup._browser_send_and_wait_reply(page, reply_timeout=5)
+    assert n == len("Send")
+    assert page.clicked, "send button must have been clicked"
+
+
+def test_browser_send_reply_timeout(monkeypatch):
+    page = FakePage()
+    page.stage = "chat"
+    monkeypatch.setattr(chat_warmup.time, "sleep", lambda s: None)
+    with pytest.raises(chat_warmup.ChatWarmupUnavailableError, match="assistant reply timeout"):
+        chat_warmup._browser_send_and_wait_reply(page, reply_timeout=0.01)
 
 
 def test_web_login_happy_path_password_only(monkeypatch):

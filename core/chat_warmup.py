@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -339,32 +338,107 @@ def _web_login(page, email: str, password: str, totp_secret: str | None,
     raise ChatWarmupUnavailableError("login did not complete in time")
 
 
-def _sync_cookies_to_session(driver, session) -> None:
-    """Copy browser cookies + UA into a protocol session (no values logged)."""
+COMPOSER_SELECTORS = [
+    "#prompt-textarea",
+    'div[contenteditable="true"]',
+    "textarea",
+]
+SEND_BUTTON_SELECTORS = [
+    'button[data-testid="send-button"]',
+    'button[aria-label*="Send" i]',
+    'button[aria-label*="Отправить" i]',
+]
+ASSISTANT_TURN_SELECTORS = [
+    'div[data-message-author-role="assistant"]',
+    "article",
+]
+MODAL_DISMISS_TEXTS = ("skip", "not now", "continue", "got it", "maybe later", "dismiss")
+
+
+def _dismiss_onboarding_modal(page) -> None:
+    """Best-effort dismissal of post-login onboarding popups."""
     try:
-        cookies = driver.context.cookies()
-    except Exception as exc:
-        raise ChatWarmupUnavailableError(f"cookie export failed: {type(exc).__name__}")
-    count = 0
-    for c in cookies or []:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    try:
+        buttons = page.locator("button").all()
+    except Exception:
+        return
+    for btn in buttons:
         try:
-            domain = str(c.get("domain", "") or "")
-            if domain.startswith("."):
-                domain = domain[1:]
-            session.session.cookies.set(c["name"], c["value"], domain=domain)
-            count += 1
+            if not btn.is_visible():
+                continue
+            if (btn.inner_text(timeout=1000) or "").strip().lower() in MODAL_DISMISS_TEXTS:
+                btn.click(timeout=3000)
+                time.sleep(1.0)
+                return
         except Exception:
             continue
+
+
+def _browser_send_and_wait_reply(page, reply_timeout: float = 150) -> int:
+    """Type one minimal message into the web composer and wait for reply text.
+
+    Fully browser-native (no protocol calls): returns reply char count.
+    Raises ChatWarmupUnavailableError on any failure.
+    """
+    composer = _first_visible_locator(page, COMPOSER_SELECTORS, timeout_ms=20000)
+    if composer is None:
+        _dismiss_onboarding_modal(page)
+        composer = _first_visible_locator(page, COMPOSER_SELECTORS, timeout_ms=10000)
+    if composer is None:
+        raise ChatWarmupUnavailableError("composer not found")
     try:
-        ua = driver.page.evaluate("navigator.userAgent")
-    except Exception:
-        ua = ""
-    if ua:
+        composer.click(timeout=5000)
+        time.sleep(0.5)
+        composer.fill("ping", timeout=10000)
+    except Exception as exc:
+        raise ChatWarmupUnavailableError(f"composer fill failed: {type(exc).__name__}")
+    time.sleep(1.0)
+    sent = False
+    for sel in SEND_BUTTON_SELECTORS:
         try:
-            session.browser_profile["user_agent"] = str(ua)
+            btn = page.locator(sel).first
+            if btn.is_visible() and btn.is_enabled():
+                btn.click(timeout=5000)
+                sent = True
+                break
         except Exception:
-            pass
-    logger.info("[ChatWarmup] synced %d cookies into protocol session", count)
+            continue
+    if not sent:
+        try:
+            page.keyboard.press("Enter")
+            sent = True
+        except Exception as exc:
+            raise ChatWarmupUnavailableError(f"message submit failed: {type(exc).__name__}")
+    deadline = time.time() + max(1.0, reply_timeout)
+    stable_rounds = 0
+    last_len = 0
+    while time.time() < deadline:
+        text = ""
+        for sel in ASSISTANT_TURN_SELECTORS:
+            try:
+                turns = page.locator(sel).all()
+            except Exception:
+                continue
+            if not turns:
+                continue
+            try:
+                text = str(turns[-1].inner_text(timeout=5000) or "")
+            except Exception:
+                continue
+            if text.strip():
+                break
+        if len(text.strip()) > 0 and len(text) == last_len:
+            stable_rounds += 1
+            if stable_rounds >= 2:
+                return len(text)
+        elif len(text.strip()) > 0:
+            stable_rounds = 0
+            last_len = len(text)
+        time.sleep(5.0)
+    raise ChatWarmupUnavailableError("assistant reply timeout")
 
 
 def warmup_chat_before_oauth(
@@ -379,8 +453,6 @@ def warmup_chat_before_oauth(
     Returns {"reply_chars": N}. Raises ChatWarmupUnavailableError on any
     failure. Makes no purchase and leaves no account record behind.
     """
-    from core.session import BrowserSession
-    from core import chatgpt_verify
     from config import cloakbrowser as cloak_cfg
 
     masked = _mask_email(email)
@@ -404,20 +476,9 @@ def warmup_chat_before_oauth(
             )
         except Exception as exc:
             raise ChatWarmupUnavailableError(f"chat UI not ready: {type(exc).__name__}")
-        session = BrowserSession(
-            proxy=proxy or "",
-            fingerprint_seed=f"sub2api-warmup:{str(email).strip().lower()}:{uuid.uuid4()}",
-            detect_exit_geo=False,
-        )
-        try:
-            _sync_cookies_to_session(driver, session)
-            proof = chatgpt_verify.verify_chat_reply(session, email)
-        finally:
-            try:
-                session.close()
-            except Exception:
-                pass
-        logger.info("[ChatWarmup] warm-up ok for %s: reply_chars=%d", masked, proof["reply_chars"])
+        reply_chars = _browser_send_and_wait_reply(driver.page)
+        proof = {"reply_chars": reply_chars}
+        logger.info("[ChatWarmup] warm-up ok for %s: reply_chars=%d", masked, reply_chars)
         return proof
     finally:
         cloak_cfg.CLOAK_HEADLESS = prev_headless
